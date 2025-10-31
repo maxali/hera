@@ -24,10 +24,41 @@ var (
 	tunnelConfigPath = "/etc/hera/tunnels"
 	tunnelLogPath    = "/var/log/hera"
 
+	// Tunnel naming prefix to identify Hera-managed tunnels
+	tunnelNamePrefix = "hera-"
+
 	// Zone ID cache for DNS operations
 	zoneIDCache   = make(map[string]string) // domain -> zone_id
 	zoneIDCacheMu sync.RWMutex              // Protects zone ID cache
 )
+
+// getTunnelName returns the full tunnel name with Hera prefix
+// Normalizes hostname to lowercase for consistency
+func getTunnelName(hostname string) string {
+	if hostname == "" {
+		log.Warning("getTunnelName called with empty hostname")
+		return tunnelNamePrefix
+	}
+	// Normalize to lowercase to prevent case-sensitivity issues
+	normalized := strings.ToLower(hostname)
+	// Warn if hostname already has the prefix
+	if strings.HasPrefix(normalized, tunnelNamePrefix) {
+		log.Warningf("Hostname %s already has 'hera-' prefix, tunnel will be named '%s'",
+			hostname, tunnelNamePrefix+normalized)
+	}
+	return tunnelNamePrefix + normalized
+}
+
+// getHostnameFromTunnelName extracts the original hostname from a prefixed tunnel name
+func getHostnameFromTunnelName(tunnelName string) string {
+	return strings.TrimPrefix(tunnelName, tunnelNamePrefix)
+}
+
+// isHeraTunnel checks if a tunnel name was created by Hera
+func isHeraTunnel(tunnelName string) bool {
+	return strings.HasPrefix(tunnelName, tunnelNamePrefix) &&
+		len(tunnelName) > len(tunnelNamePrefix)
+}
 
 // Tunnel holds the corresponding config and certificate for a tunnel
 type Tunnel struct {
@@ -93,7 +124,8 @@ func DeregisterTunnel(hostname string) error {
 
 // Start starts a tunnel and registers it
 func (t *Tunnel) Start() error {
-	log.Infof("Starting tunnel for %s", t.Config.Hostname)
+	tunnelName := getTunnelName(t.Config.Hostname)
+	log.Infof("Starting tunnel %s for hostname %s", tunnelName, t.Config.Hostname)
 
 	// Create config directory if it doesn't exist
 	err := os.MkdirAll(tunnelConfigPath, 0755)
@@ -252,6 +284,8 @@ func (t *Tunnel) writeConfigFile() error {
 
 	var contents string
 
+	tunnelName := getTunnelName(t.Config.Hostname)
+
 	if tunnelExists && tunnelUUID != "" {
 		// Tunnel exists - use the UUID directly with ingress rules
 		// This works even without credential files
@@ -271,19 +305,19 @@ func (t *Tunnel) writeConfigFile() error {
 			tunnelUUID,  // Use UUID instead of name for existing tunnels
 			t.Certificate.FullPath(),
 			t.LogFilePath(),
-			t.Config.Hostname,
+			t.Config.Hostname,  // Use original hostname for DNS routing
 			t.Config.IP,
 			t.Config.Port)
 	} else {
 		// Tunnel doesn't exist - create it first
-		log.Infof("Tunnel %s doesn't exist in Cloudflare, creating it...", t.Config.Hostname)
+		log.Infof("Tunnel %s doesn't exist in Cloudflare, creating it...", tunnelName)
 		err := t.createTunnel()
 		if err != nil {
 			return fmt.Errorf("failed to create tunnel in Cloudflare: %w", err)
 		}
-		log.Infof("Successfully created tunnel %s in Cloudflare", t.Config.Hostname)
+		log.Infof("Successfully created tunnel %s in Cloudflare", tunnelName)
 
-		// Now write config with the tunnel name
+		// Now write config with the prefixed tunnel name
 		configLines := []string{
 			"tunnel: %s",
 			"origincert: %s",
@@ -297,10 +331,10 @@ func (t *Tunnel) writeConfigFile() error {
 		}
 
 		contents = fmt.Sprintf(strings.Join(configLines, "\n"),
-			t.Config.Hostname,
+			tunnelName,          // Use prefixed name for tunnel
 			t.Certificate.FullPath(),
 			t.LogFilePath(),
-			t.Config.Hostname,
+			t.Config.Hostname,  // Use original hostname for DNS routing
 			t.Config.IP,
 			t.Config.Port)
 	}
@@ -317,6 +351,7 @@ func (t *Tunnel) writeConfigFile() error {
 
 // checkTunnelExists checks if a tunnel with this name exists in Cloudflare
 // Returns (exists bool, uuid string)
+// Supports backward compatibility: checks for both prefixed (hera-) and legacy (unprefixed) tunnels
 func (t *Tunnel) checkTunnelExists() (bool, string) {
 	// Use cloudflared tunnel list to check if tunnel exists
 	cmd := exec.Command("cloudflared", "--origincert", t.Certificate.FullPath(), "tunnel", "list", "--output", "json")
@@ -333,12 +368,26 @@ func (t *Tunnel) checkTunnelExists() (bool, string) {
 		return false, ""
 	}
 
-	// Look for our tunnel by name
+	tunnelName := getTunnelName(t.Config.Hostname)
+
 	for _, tunnel := range tunnels {
-		if name, ok := tunnel["name"].(string); ok && name == t.Config.Hostname {
-			if id, ok := tunnel["id"].(string); ok {
-				log.Infof("Found existing tunnel %s with UUID %s", t.Config.Hostname, id)
-				return true, id
+		if name, ok := tunnel["name"].(string); ok {
+			// Priority 1: Check for prefixed tunnel name (new format)
+			if name == tunnelName {
+				if id, ok := tunnel["id"].(string); ok {
+					log.Infof("Found existing tunnel %s with UUID %s", tunnelName, id)
+					return true, id
+				}
+			}
+
+			// Priority 2: Check for legacy unprefixed tunnel name (backward compatibility)
+			// This allows Hera to adopt existing tunnels created before the prefix was added
+			if name == t.Config.Hostname {
+				if id, ok := tunnel["id"].(string); ok {
+					log.Warningf("Found legacy tunnel without prefix: %s (UUID: %s) - will use it but consider migrating", name, id)
+					log.Warningf("To migrate, delete the old tunnel and restart the container: cloudflared tunnel delete %s", name)
+					return true, id
+				}
 			}
 		}
 	}
@@ -352,11 +401,14 @@ func (t *Tunnel) createTunnel() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Execute: cloudflared --origincert <cert> tunnel create <hostname>
+	// Use prefixed tunnel name
+	tunnelName := getTunnelName(t.Config.Hostname)
+
+	// Execute: cloudflared --origincert <cert> tunnel create <tunnel-name>
 	cmd := exec.CommandContext(ctx, "cloudflared",
 		"--origincert", t.Certificate.FullPath(),
 		"tunnel", "create",
-		t.Config.Hostname)
+		tunnelName)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -366,7 +418,7 @@ func (t *Tunnel) createTunnel() error {
 		outputStr := string(output)
 		// Check if tunnel already exists (race condition with another process)
 		if strings.Contains(outputStr, "already exists") || strings.Contains(outputStr, "A tunnel with that name already exists") {
-			log.Infof("Tunnel %s already exists (created by another process)", t.Config.Hostname)
+			log.Infof("Tunnel %s already exists (created by another process)", tunnelName)
 			return nil
 		}
 		return fmt.Errorf("cloudflared tunnel create failed: %v, output: %s", err, outputStr)
@@ -381,15 +433,17 @@ func (t *Tunnel) createDNSRoute() error {
 	// Check if tunnel exists to get its name or UUID
 	tunnelExists, tunnelUUID := t.checkTunnelExists()
 
+	tunnelName := getTunnelName(t.Config.Hostname)
+
 	var tunnelIdentifier string
 	if tunnelExists && tunnelUUID != "" {
 		// Use UUID for existing tunnels
 		tunnelIdentifier = tunnelUUID
-		log.Infof("Creating DNS route for existing tunnel %s (UUID: %s)", t.Config.Hostname, tunnelUUID)
+		log.Infof("Creating DNS route for existing tunnel %s (UUID: %s)", tunnelName, tunnelUUID)
 	} else {
-		// Use hostname for new tunnels
-		tunnelIdentifier = t.Config.Hostname
-		log.Infof("Creating DNS route for new tunnel %s", t.Config.Hostname)
+		// Use prefixed tunnel name for new tunnels
+		tunnelIdentifier = tunnelName
+		log.Infof("Creating DNS route for new tunnel %s", tunnelName)
 	}
 
 	// Create DNS route using cloudflared
@@ -398,8 +452,8 @@ func (t *Tunnel) createDNSRoute() error {
 		"--origincert", t.Certificate.FullPath(),
 		"tunnel", "route", "dns",
 		"--overwrite-dns",
-		tunnelIdentifier,  // tunnel name or UUID
-		t.Config.Hostname) // hostname to route
+		tunnelIdentifier,  // tunnel name or UUID (with hera- prefix)
+		t.Config.Hostname) // hostname to route (original hostname without prefix)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

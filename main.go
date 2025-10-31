@@ -29,6 +29,7 @@ func main() {
 	}
 
 	log.Infof("Hera v%s has started", CurrentVersion)
+	log.Infof("Tunnel name prefix: 'hera-' (only tunnels with this prefix will be managed)")
 
 	err = VerifyCertificates(listener.Fs)
 	if err != nil {

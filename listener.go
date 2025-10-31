@@ -201,6 +201,14 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 	orphanedTunnels := make([]TunnelInfo, 0)
 
 	for _, tunnel := range allTunnels {
+		// CRITICAL: Only process tunnels created by Hera (with hera- prefix)
+		// This prevents Hera from deleting manually created tunnels or tunnels
+		// created by other tools/processes
+		if !isHeraTunnel(tunnel.Name) {
+			log.Debugf("Skipping tunnel %s - not created by Hera (no hera- prefix)", tunnel.Name)
+			continue
+		}
+
 		// Skip if tunnel has an active container
 		if expectedTunnels[tunnel.Name] {
 			log.Debugf("Tunnel %s has active container, skipping", tunnel.Name)
@@ -264,25 +272,30 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 					continue
 				}
 				hostname := getLabel(heraHostname, container)
-				if hostname == t.Name {
-					log.Infof("Tunnel %s now has active container, skipping deletion", t.Name)
-					return // Container started during GC - abort deletion
+				if hostname != "" {
+					expectedTunnelName := getTunnelName(hostname)
+					if expectedTunnelName == t.Name {
+						log.Infof("Tunnel %s now has active container, skipping deletion", t.Name)
+						return // Container started during GC - abort deletion
+					}
 				}
 			}
 
 			// Safety check 2: Verify tunnel is NOT in local registry (thread-safe)
-			// CRITICAL: tunnel.Start() registers BEFORE starting process (tunnel.go:116)
+			// CRITICAL: tunnel.Start() registers BEFORE starting process (tunnel.go:128)
 			// A tunnel in registry but without running process is in "creation phase"
 			// Deleting it would cause the pending cloudflared process to fail
-			// NOTE: GetTunnelForHost must use registryMu.RLock() for thread safety
-			if _, err := GetTunnelForHost(t.Name); err == nil {
+			// NOTE: Registry uses hostname (without prefix) as key
+			hostname := getHostnameFromTunnelName(t.Name)
+			if _, err := GetTunnelForHost(hostname); err == nil {
 				log.Infof("Tunnel %s now in registry, skipping deletion", t.Name)
 				return // Tunnel was registered during GC - abort deletion
 			}
 
 			// Safety check 3: Verify process is NOT running
 			// (double-check against ProcessManager state)
-			if processManager.IsRunning(t.Name) {
+			// NOTE: ProcessManager uses hostname (without prefix) as key
+			if processManager.IsRunning(hostname) {
 				log.Warningf("Tunnel %s has running process, skipping deletion", t.Name)
 				return // Process is active - abort deletion
 			}
@@ -368,9 +381,10 @@ func (l *Listener) getExpectedTunnels() map[string]bool {
 		close(results)
 	}()
 
-	// Collect results
+	// Collect results and convert to prefixed tunnel names
 	for result := range results {
-		expectedTunnels[result.hostname] = true
+		tunnelName := getTunnelName(result.hostname)
+		expectedTunnels[tunnelName] = true
 	}
 
 	log.Infof("Found %d containers with hera.hostname labels", len(expectedTunnels))
