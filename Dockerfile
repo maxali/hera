@@ -5,11 +5,9 @@ RUN apk add --no-cache ca-certificates git
 
 WORKDIR /src
 
-COPY go.mod .
-COPY go.sum .
-RUN go mod download
-
 COPY . .
+
+RUN go mod tidy
 
 RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dist/hera
 
