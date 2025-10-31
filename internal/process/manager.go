@@ -80,7 +80,7 @@ func (pm *ProcessManager) Start(hostname string, config *Config) error {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
-	cmd := exec.Command("cloudflared", "--config", config.ConfigPath, "--name", hostname)
+	cmd := exec.Command("cloudflared", "tunnel", "--config", config.ConfigPath, "run")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -189,7 +189,7 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 		return
 	}
 
-	cmd := exec.Command("cloudflared", "--config", ps.config.ConfigPath, "--name", hostname)
+	cmd := exec.Command("cloudflared", "tunnel", "--config", ps.config.ConfigPath, "run")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{

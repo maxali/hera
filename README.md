@@ -13,6 +13,7 @@ _This repository started as a fork of [aschzero/hera](https://github.com/aschzer
 * Continuously monitors the state of your services for automated tunnel creation.
 * Revives tunnels on running containers when Hera is restarted.
 * Automatically cleans up orphaned tunnels from Cloudflare when containers are removed.
+* **Optional DNS record cleanup** – Automatically removes DNS (CNAME) records when tunnels are deleted using the Cloudflare API.
 * Uses native Go process management to ensure active tunnel processes are kept alive.
 * Low memory footprint and high performance – services can be accessed through a tunnel within seconds.
 * Requires a minimal amount of configuration so you can get up and running quickly.
@@ -103,11 +104,17 @@ docker run \
 
 ### Tunnel Configuration
 
-Hera utilizes labels for configuration as a way to let you be explicit about which containers you want enabled. There are only two labels that need to be defined:
+Hera utilizes labels for configuration as a way to let you be explicit about which containers you want enabled.
+
+**Required Labels:**
 
 * `hera.hostname` - The hostname is the address you'll use to request the service outside of your home network. It must be the same as the domain you used to configure your certificate and can either be a root domain or subdomain (e.g.: `mysite.com` or `blog.mysite.com`).
 
 * `hera.port` - The port your service is running on inside the container.
+
+**Optional Labels:**
+
+* `hera.dns.cleanup` - Set to `true` or `false` to enable/disable DNS record cleanup for this specific container. Overrides the global `CLOUDFLARE_DNS_CLEANUP_ENABLED` environment variable. See [DNS Record Cleanup](#dns-record-cleanup) for more details.
 
 ⚠️ _Note: you can still expose a different port to your host network if desired, but the `hera.port` label value needs to be the internal port within the container._
 
@@ -192,6 +199,78 @@ Tunnels are considered orphaned when:
 
 ⚠️ **Note:** Manually created tunnels (not managed by Hera) are safe from garbage collection if they meet the age and connection requirements. Use `HERA_GC_DRY_RUN=true` to preview deletions before enabling.
 
+### DNS Record Cleanup
+
+By default, when a tunnel is deleted using `cloudflared`, the DNS records (CNAME entries) are **not** automatically removed from Cloudflare. This leaves orphaned DNS records in your Cloudflare dashboard.
+
+Hera can optionally clean up DNS records automatically using the Cloudflare API when containers are stopped.
+
+**Prerequisites:**
+- A Cloudflare API Token with DNS Edit permissions
+- Create one at: https://dash.cloudflare.com/profile/api-tokens
+- Use the "Edit zone DNS" template or create a custom token with `DNS:Edit` permission
+
+**Configuration:**
+
+DNS cleanup can be configured globally (environment variable) or per-container (label):
+
+```bash
+# Global: Enable DNS cleanup for all tunnels (requires API token)
+docker run -e CLOUDFLARE_API_TOKEN=your_token_here \
+           -e CLOUDFLARE_DNS_CLEANUP_ENABLED=true ...
+
+# Per-container: Enable only for specific containers (overrides global setting)
+docker run --label hera.dns.cleanup=true ...
+```
+
+**Configuration Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `CLOUDFLARE_API_TOKEN` | Environment | _(none)_ | **Required** for DNS cleanup. Your Cloudflare API token. |
+| `CLOUDFLARE_DNS_CLEANUP_ENABLED` | Environment | `false` | Global default for DNS cleanup. |
+| `hera.dns.cleanup` | Label | _(none)_ | Per-container override. Set to `true` or `false`. |
+
+**Priority:** Container labels override environment variables.
+
+**Behavior:**
+
+When a container stops:
+1. Hera checks if DNS cleanup is enabled (label > environment variable)
+2. If enabled and `CLOUDFLARE_API_TOKEN` is set:
+   - Retrieves the zone ID for the domain (cached for performance)
+   - Finds the CNAME record ID for the hostname
+   - Deletes the DNS record from Cloudflare
+3. Deletes the tunnel from Cloudflare (as usual)
+4. Cleans up local configuration files
+
+**Error Handling:**
+- If DNS cleanup fails (missing token, API error, etc.), a warning is logged
+- Tunnel deletion **always proceeds** regardless of DNS cleanup outcome
+- This ensures tunnels are cleaned up even if DNS operations fail
+
+**Example:**
+
+```yaml
+# Enable DNS cleanup for specific containers
+nginx:
+  image: nginx:latest
+  networks:
+    - hera
+  labels:
+    hera.hostname: nginx.mysite.com
+    hera.port: 80
+    hera.dns.cleanup: true  # Enable DNS cleanup for this container
+
+# Or enable globally for all containers
+hera:
+  environment:
+    - CLOUDFLARE_API_TOKEN=your_token_here
+    - CLOUDFLARE_DNS_CLEANUP_ENABLED=true
+```
+
+⚠️ **Note:** DNS cleanup is disabled by default for backward compatibility. Existing deployments will continue working without any changes.
+
 ---
 
 ## Examples
@@ -225,9 +304,13 @@ services:
       - hera
     environment:
       # Optional: Configure garbage collection
-      - HERA_GC_ENABLED=true          # Enable/disable GC (default: true)
-      - HERA_GC_MIN_AGE_MINUTES=10    # Minimum tunnel age (default: 10)
-      # - HERA_GC_DRY_RUN=true        # Preview deletions without executing
+      - HERA_GC_ENABLED=true                    # Enable/disable GC (default: true)
+      - HERA_GC_MIN_AGE_MINUTES=10              # Minimum tunnel age (default: 10)
+      # - HERA_GC_DRY_RUN=true                  # Preview deletions without executing
+
+      # Optional: Configure DNS cleanup
+      - CLOUDFLARE_API_TOKEN=your_token_here    # Required for DNS cleanup
+      - CLOUDFLARE_DNS_CLEANUP_ENABLED=true     # Enable DNS cleanup globally (default: false)
 
   nginx:
     image: nginx:latest
@@ -236,6 +319,18 @@ services:
     labels:
       hera.hostname: mysite.com
       hera.port: 80
+      # Optional: Override DNS cleanup per-container
+      hera.dns.cleanup: true
+
+  whoami:
+    image: traefik/whoami:latest
+    networks:
+      - hera
+    labels:
+      hera.hostname: whoami.mysite.com
+      hera.port: 80
+      # DNS cleanup disabled for this specific container
+      hera.dns.cleanup: false
 
 networks:
   hera:

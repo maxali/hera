@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/spf13/afero"
+	"golang.org/x/net/publicsuffix"
 	"hera/internal/process"
 )
 
@@ -20,12 +23,17 @@ var (
 	registryMu       sync.RWMutex // Protects registry from concurrent access
 	tunnelConfigPath = "/etc/hera/tunnels"
 	tunnelLogPath    = "/var/log/hera"
+
+	// Zone ID cache for DNS operations
+	zoneIDCache   = make(map[string]string) // domain -> zone_id
+	zoneIDCacheMu sync.RWMutex              // Protects zone ID cache
 )
 
 // Tunnel holds the corresponding config and certificate for a tunnel
 type Tunnel struct {
-	Config      *TunnelConfig
-	Certificate *Certificate
+	Config            *TunnelConfig
+	Certificate       *Certificate
+	DNSCleanupEnabled bool // Whether to clean up DNS records on tunnel deletion
 }
 
 // TunnelConfig holds the necessary configuration for a tunnel
@@ -140,68 +148,100 @@ func (t *Tunnel) Stop() error {
 	log.Infof("Stopping tunnel for %s", t.Config.Hostname)
 
 	// Stop the process
+	log.Infof("Step 1/4: Stopping cloudflared process for %s", t.Config.Hostname)
 	err := processManager.Stop(t.Config.Hostname)
 	if err != nil {
 		log.Errorf("Failed to stop process for %s: %v", t.Config.Hostname, err)
+	} else {
+		log.Infof("Successfully stopped cloudflared process for %s", t.Config.Hostname)
 	}
 
 	// Delete the tunnel and its DNS route from Cloudflare
+	log.Infof("Step 2/4: Deleting tunnel from Cloudflare for %s", t.Config.Hostname)
 	err = t.deleteTunnelAndRoute()
 	if err != nil {
 		log.Errorf("Failed to delete tunnel from Cloudflare for %s: %v", t.Config.Hostname, err)
+		// Continue with cleanup even if Cloudflare deletion fails
+	} else {
+		log.Infof("Successfully deleted tunnel from Cloudflare for %s", t.Config.Hostname)
 	}
 
 	// Remove config file
+	log.Infof("Step 3/4: Removing config file for %s", t.Config.Hostname)
 	configFile := t.ConfigFilePath()
 	if _, err := os.Stat(configFile); err == nil {
-		os.Remove(configFile)
+		if err := os.Remove(configFile); err != nil {
+			log.Errorf("Failed to remove config file for %s: %v", t.Config.Hostname, err)
+		} else {
+			log.Infof("Successfully removed config file for %s", t.Config.Hostname)
+		}
 	}
 
 	// Deregister the tunnel
+	log.Infof("Step 4/4: Deregistering tunnel %s from registry", t.Config.Hostname)
 	err = DeregisterTunnel(t.Config.Hostname)
 	if err != nil {
+		log.Errorf("Failed to deregister tunnel %s: %v", t.Config.Hostname, err)
 		return err
 	}
 
+	log.Infof("Successfully completed all stop steps for %s", t.Config.Hostname)
 	return nil
 }
 
 // deleteTunnelAndRoute deletes the tunnel and its DNS route from Cloudflare
 func (t *Tunnel) deleteTunnelAndRoute() error {
-	// First, try to delete the DNS route
-	// The DNS route must be deleted before the tunnel can be deleted
-	log.Debugf("Attempting to delete DNS route for %s", t.Config.Hostname)
+	log.Infof("Attempting to delete tunnel and DNS route for %s from Cloudflare", t.Config.Hostname)
+
+	// Step 1: Clean up DNS record using Cloudflare API (if enabled)
+	// This must happen BEFORE tunnel deletion because cloudflared doesn't remove DNS records
+	log.Infof("Step 1: Attempting DNS record cleanup for %s", t.Config.Hostname)
+	err := t.cleanupDNSRecord()
+	if err != nil {
+		// Log error but continue with tunnel deletion
+		log.Warningf("DNS cleanup failed for %s: %v - continuing with tunnel deletion", t.Config.Hostname, err)
+	}
+
+	// Step 2: Delete the tunnel using cloudflared
+	// Note: cloudflared tunnel delete does NOT remove DNS records automatically
 
 	// Delete DNS route using cloudflared
 	// Note: cloudflared doesn't have a direct "unroute" command,
 	// but deleting the tunnel will also clean up the CNAME
 
 	// Check if tunnel exists before attempting deletion
+	log.Infof("Checking if tunnel %s exists in Cloudflare...", t.Config.Hostname)
 	tunnelExists, tunnelUUID := t.checkTunnelExists()
 	if !tunnelExists {
-		log.Debugf("Tunnel %s doesn't exist in Cloudflare, skipping deletion", t.Config.Hostname)
+		log.Infof("Tunnel %s doesn't exist in Cloudflare, skipping deletion", t.Config.Hostname)
 		return nil
 	}
 
+	log.Infof("Tunnel %s exists in Cloudflare (UUID: %s), proceeding with deletion", t.Config.Hostname, tunnelUUID)
+
 	// Delete the tunnel using cloudflared
 	// This will also remove the associated CNAME record
+	// CRITICAL: Must use UUID, not hostname, for deletion
 	cmd := exec.Command("cloudflared",
 		"--origincert", t.Certificate.FullPath(),
 		"tunnel", "delete",
-		t.Config.Hostname) // Use tunnel name for deletion
+		"-f", // Force delete without confirmation
+		tunnelUUID) // Use UUID instead of name for deletion
 
+	log.Infof("Executing: cloudflared --origincert %s tunnel delete -f %s", t.Certificate.FullPath(), tunnelUUID)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Check if error is because tunnel is already deleted
 		outputStr := string(output)
+		log.Errorf("cloudflared delete command failed: %v, output: %s", err, outputStr)
 		if strings.Contains(outputStr, "not found") || strings.Contains(outputStr, "does not exist") {
-			log.Debugf("Tunnel %s already deleted or doesn't exist", t.Config.Hostname)
+			log.Infof("Tunnel %s already deleted or doesn't exist (treating as success)", t.Config.Hostname)
 			return nil
 		}
 		return fmt.Errorf("failed to delete tunnel %s: %v, output: %s", t.Config.Hostname, err, outputStr)
 	}
 
-	log.Infof("Successfully deleted tunnel %s (UUID: %s) from Cloudflare", t.Config.Hostname, tunnelUUID)
+	log.Infof("Successfully deleted tunnel %s (UUID: %s) from Cloudflare. Output: %s", t.Config.Hostname, tunnelUUID, string(output))
 	return nil
 }
 
@@ -235,7 +275,15 @@ func (t *Tunnel) writeConfigFile() error {
 			t.Config.IP,
 			t.Config.Port)
 	} else {
-		// Tunnel doesn't exist - let cloudflared create it with proper ingress rules
+		// Tunnel doesn't exist - create it first
+		log.Infof("Tunnel %s doesn't exist in Cloudflare, creating it...", t.Config.Hostname)
+		err := t.createTunnel()
+		if err != nil {
+			return fmt.Errorf("failed to create tunnel in Cloudflare: %w", err)
+		}
+		log.Infof("Successfully created tunnel %s in Cloudflare", t.Config.Hostname)
+
+		// Now write config with the tunnel name
 		configLines := []string{
 			"tunnel: %s",
 			"origincert: %s",
@@ -249,7 +297,7 @@ func (t *Tunnel) writeConfigFile() error {
 		}
 
 		contents = fmt.Sprintf(strings.Join(configLines, "\n"),
-			t.Config.Hostname,  // Use name for new tunnels (will auto-create)
+			t.Config.Hostname,
 			t.Certificate.FullPath(),
 			t.LogFilePath(),
 			t.Config.Hostname,
@@ -296,6 +344,36 @@ func (t *Tunnel) checkTunnelExists() (bool, string) {
 	}
 
 	return false, ""
+}
+
+// createTunnel creates a new tunnel in Cloudflare using cloudflared CLI
+func (t *Tunnel) createTunnel() error {
+	// Create context with 30-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Execute: cloudflared --origincert <cert> tunnel create <hostname>
+	cmd := exec.CommandContext(ctx, "cloudflared",
+		"--origincert", t.Certificate.FullPath(),
+		"tunnel", "create",
+		t.Config.Hostname)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("tunnel creation timed out after 30s")
+		}
+		outputStr := string(output)
+		// Check if tunnel already exists (race condition with another process)
+		if strings.Contains(outputStr, "already exists") || strings.Contains(outputStr, "A tunnel with that name already exists") {
+			log.Infof("Tunnel %s already exists (created by another process)", t.Config.Hostname)
+			return nil
+		}
+		return fmt.Errorf("cloudflared tunnel create failed: %v, output: %s", err, outputStr)
+	}
+
+	log.Infof("Tunnel creation output: %s", string(output))
+	return nil
 }
 
 // createDNSRoute creates or updates the DNS route for this tunnel
@@ -478,5 +556,236 @@ func DeleteTunnelByName(tunnelName string, certPath string) error {
 	}
 
 	log.Infof("Deleted orphaned tunnel: %s", tunnelName)
+	return nil
+}
+
+// ============================================
+// DNS Record Cleanup Functions (Cloudflare API)
+// ============================================
+
+// CloudflareZoneResponse represents the response from Cloudflare zones API
+type CloudflareZoneResponse struct {
+	Result []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"result"`
+	Success bool `json:"success"`
+}
+
+// CloudflareDNSRecordResponse represents the response from Cloudflare DNS records API
+type CloudflareDNSRecordResponse struct {
+	Result []struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"result"`
+	Success bool `json:"success"`
+}
+
+// CloudflareDeleteResponse represents the response from Cloudflare delete API
+type CloudflareDeleteResponse struct {
+	Result struct {
+		ID string `json:"id"`
+	} `json:"result"`
+	Success bool `json:"success"`
+}
+
+// getZoneID retrieves the zone ID for a domain from Cloudflare API
+// Results are cached to avoid repeated API calls
+func getZoneID(domain string, apiToken string) (string, error) {
+	// Check cache first
+	zoneIDCacheMu.RLock()
+	if zoneID, ok := zoneIDCache[domain]; ok {
+		zoneIDCacheMu.RUnlock()
+		log.Debugf("Using cached zone ID for %s: %s", domain, zoneID)
+		return zoneID, nil
+	}
+	zoneIDCacheMu.RUnlock()
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Build API request
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones?name=%s", domain)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Execute request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get zone ID: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse response
+	var zoneResp CloudflareZoneResponse
+	if err := json.Unmarshal(body, &zoneResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !zoneResp.Success || len(zoneResp.Result) == 0 {
+		return "", fmt.Errorf("zone not found for domain %s", domain)
+	}
+
+	zoneID := zoneResp.Result[0].ID
+
+	// Cache the result
+	zoneIDCacheMu.Lock()
+	zoneIDCache[domain] = zoneID
+	zoneIDCacheMu.Unlock()
+
+	log.Infof("Retrieved zone ID for %s: %s", domain, zoneID)
+	return zoneID, nil
+}
+
+// getDNSRecordID retrieves the DNS record ID for a hostname from Cloudflare API
+func getDNSRecordID(zoneID, hostname, apiToken string) (string, error) {
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Build API request
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=CNAME&name=%s", zoneID, hostname)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Execute request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get DNS records: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse response
+	var dnsResp CloudflareDNSRecordResponse
+	if err := json.Unmarshal(body, &dnsResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !dnsResp.Success || len(dnsResp.Result) == 0 {
+		return "", fmt.Errorf("DNS record not found for hostname %s", hostname)
+	}
+
+	recordID := dnsResp.Result[0].ID
+	log.Infof("Found DNS record ID for %s: %s", hostname, recordID)
+	return recordID, nil
+}
+
+// deleteDNSRecord deletes a DNS record from Cloudflare
+func deleteDNSRecord(zoneID, recordID, apiToken string) error {
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Build API request
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, recordID)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Execute request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete DNS record: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse response
+	var deleteResp CloudflareDeleteResponse
+	if err := json.Unmarshal(body, &deleteResp); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !deleteResp.Success {
+		return fmt.Errorf("failed to delete DNS record")
+	}
+
+	log.Infof("Successfully deleted DNS record: %s", recordID)
+	return nil
+}
+
+// cleanupDNSRecord attempts to delete the DNS record for this tunnel from Cloudflare
+// Returns error only for critical failures; logs warnings for non-critical issues
+func (t *Tunnel) cleanupDNSRecord() error {
+	// Check if DNS cleanup is enabled for this tunnel
+	if !t.DNSCleanupEnabled {
+		log.Debugf("DNS cleanup disabled for %s, skipping", t.Config.Hostname)
+		return nil
+	}
+
+	// Check if API token is available
+	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	if apiToken == "" {
+		log.Warningf("CLOUDFLARE_API_TOKEN not set, skipping DNS cleanup for %s", t.Config.Hostname)
+		return nil
+	}
+
+	log.Infof("Starting DNS cleanup for %s", t.Config.Hostname)
+
+	// Get root domain for zone lookup
+	domain, err := publicsuffix.EffectiveTLDPlusOne(t.Config.Hostname)
+	if err != nil {
+		log.Warningf("Failed to extract root domain from %s: %v - skipping DNS cleanup", t.Config.Hostname, err)
+		return nil
+	}
+
+	// Get zone ID
+	zoneID, err := getZoneID(domain, apiToken)
+	if err != nil {
+		log.Warningf("Failed to get zone ID for %s: %v - skipping DNS cleanup", domain, err)
+		return nil
+	}
+
+	// Get DNS record ID
+	recordID, err := getDNSRecordID(zoneID, t.Config.Hostname, apiToken)
+	if err != nil {
+		log.Warningf("Failed to get DNS record ID for %s: %v - skipping DNS cleanup", t.Config.Hostname, err)
+		return nil
+	}
+
+	// Delete DNS record
+	err = deleteDNSRecord(zoneID, recordID, apiToken)
+	if err != nil {
+		log.Warningf("Failed to delete DNS record for %s: %v - proceeding with tunnel deletion", t.Config.Hostname, err)
+		return nil
+	}
+
+	log.Infof("Successfully cleaned up DNS record for %s", t.Config.Hostname)
 	return nil
 }
