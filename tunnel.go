@@ -1,22 +1,27 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/afero"
+	"hera/internal/process"
 )
 
 var (
 	registry = make(map[string]*Tunnel)
+	tunnelConfigPath = "/etc/hera/tunnels"
+	tunnelLogPath = "/var/log/hera"
 )
 
-// Tunnel holds the corresponding config, certificate, and service for a tunnel
+// Tunnel holds the corresponding config and certificate for a tunnel
 type Tunnel struct {
 	Config      *TunnelConfig
 	Certificate *Certificate
-	Service     *Service
 }
 
 // TunnelConfig holds the necessary configuration for a tunnel
@@ -28,12 +33,9 @@ type TunnelConfig struct {
 
 // NewTunnel returns a Tunnel with its corresponding config and certificate
 func NewTunnel(config *TunnelConfig, certificate *Certificate) *Tunnel {
-	service := NewService(config.Hostname)
-
 	tunnel := &Tunnel{
 		Config:      config,
 		Certificate: certificate,
-		Service:     service,
 	}
 
 	return tunnel
@@ -51,48 +53,108 @@ func GetTunnelForHost(hostname string) (*Tunnel, error) {
 	return tunnel, nil
 }
 
-// Start starts a tunnel
+// RegisterTunnel adds a tunnel to the registry
+func RegisterTunnel(hostname string, tunnel *Tunnel) error {
+	_, ok := registry[hostname]
+
+	if ok {
+		return fmt.Errorf("Tunnel already exists for %s", hostname)
+	}
+
+	registry[hostname] = tunnel
+
+	return nil
+}
+
+// DeregisterTunnel removes a tunnel from the registry
+func DeregisterTunnel(hostname string) error {
+	_, ok := registry[hostname]
+
+	if !ok {
+		return fmt.Errorf("No tunnel registered for %s", hostname)
+	}
+
+	delete(registry, hostname)
+
+	return nil
+}
+
+// Start starts a tunnel and registers it
 func (t *Tunnel) Start() error {
-	err := t.prepareService()
+	log.Infof("Starting tunnel for %s", t.Config.Hostname)
+
+	// Create config directory if it doesn't exist
+	err := os.MkdirAll(tunnelConfigPath, 0755)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	err = t.startService()
+	// Create log directory if it doesn't exist
+	err = os.MkdirAll(tunnelLogPath, 0755)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create log directory: %w", err)
 	}
 
-	registry[t.Config.Hostname] = t
-
-	return nil
-}
-
-// Stop stops a tunnel
-func (t *Tunnel) Stop() error {
-	log.Infof("Stopping tunnel %s", t.Config.Hostname)
-
-	err := t.Service.Stop()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// prepareService creates the service and necessary files for the tunnel service
-func (t *Tunnel) prepareService() error {
-	err := t.Service.Create()
-	if err != nil {
-		return err
-	}
-
+	// Write config file
 	err = t.writeConfigFile()
 	if err != nil {
 		return err
 	}
 
-	err = t.writeRunFile()
+	// Start the process using ProcessManager
+	config := &process.Config{
+		ConfigPath: t.ConfigFilePath(),
+		LogFile:    t.LogFilePath(),
+	}
+
+	err = processManager.Start(t.Config.Hostname, config)
+	if err != nil {
+		return fmt.Errorf("failed to start process for %s: %w", t.Config.Hostname, err)
+	}
+
+	// Register the tunnel
+	err = RegisterTunnel(t.Config.Hostname, t)
+	if err != nil {
+		// If registration fails, stop the process
+		processManager.Stop(t.Config.Hostname)
+		return err
+	}
+
+	// Create DNS route for the tunnel
+	err = t.createDNSRoute()
+	if err != nil {
+		log.Errorf("Failed to create DNS route for %s: %v", t.Config.Hostname, err)
+		// Don't fail the entire start process if DNS route creation fails
+		// The tunnel is already running and can be manually routed
+	}
+
+	return nil
+}
+
+// Stop stops a tunnel and deregisters it
+func (t *Tunnel) Stop() error {
+	log.Infof("Stopping tunnel for %s", t.Config.Hostname)
+
+	// Stop the process
+	err := processManager.Stop(t.Config.Hostname)
+	if err != nil {
+		log.Errorf("Failed to stop process for %s: %v", t.Config.Hostname, err)
+	}
+
+	// Delete the tunnel and its DNS route from Cloudflare
+	err = t.deleteTunnelAndRoute()
+	if err != nil {
+		log.Errorf("Failed to delete tunnel from Cloudflare for %s: %v", t.Config.Hostname, err)
+	}
+
+	// Remove config file
+	configFile := t.ConfigFilePath()
+	if _, err := os.Stat(configFile); err == nil {
+		os.Remove(configFile)
+	}
+
+	// Deregister the tunnel
+	err = DeregisterTunnel(t.Config.Hostname)
 	if err != nil {
 		return err
 	}
@@ -100,60 +162,100 @@ func (t *Tunnel) prepareService() error {
 	return nil
 }
 
-// startService starts the tunnel service
-func (t *Tunnel) startService() error {
-	supervised, err := t.Service.IsSupervised()
-	if err != nil {
-		return err
-	}
+// deleteTunnelAndRoute deletes the tunnel and its DNS route from Cloudflare
+func (t *Tunnel) deleteTunnelAndRoute() error {
+	// First, try to delete the DNS route
+	// The DNS route must be deleted before the tunnel can be deleted
+	log.Debugf("Attempting to delete DNS route for %s", t.Config.Hostname)
 
-	if !supervised {
-		log.Infof("Registering tunnel %s", t.Config.Hostname)
+	// Delete DNS route using cloudflared
+	// Note: cloudflared doesn't have a direct "unroute" command,
+	// but deleting the tunnel will also clean up the CNAME
 
-		err := t.Service.Supervise()
-		if err != nil {
-			return err
-		}
+	// Check if tunnel exists before attempting deletion
+	tunnelExists, tunnelUUID := t.checkTunnelExists()
+	if !tunnelExists {
+		log.Debugf("Tunnel %s doesn't exist in Cloudflare, skipping deletion", t.Config.Hostname)
 		return nil
 	}
 
-	running, err := t.Service.IsRunning()
+	// Delete the tunnel using cloudflared
+	// This will also remove the associated CNAME record
+	cmd := exec.Command("cloudflared",
+		"--origincert", t.Certificate.FullPath(),
+		"tunnel", "delete",
+		t.Config.Hostname) // Use tunnel name for deletion
+
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
+		// Check if error is because tunnel is already deleted
+		outputStr := string(output)
+		if strings.Contains(outputStr, "not found") || strings.Contains(outputStr, "does not exist") {
+			log.Debugf("Tunnel %s already deleted or doesn't exist", t.Config.Hostname)
+			return nil
+		}
+		return fmt.Errorf("failed to delete tunnel %s: %v, output: %s", t.Config.Hostname, err, outputStr)
 	}
 
-	if running {
-		log.Infof("Restarting tunnel %s", t.Config.Hostname)
-
-		err := t.Service.Restart()
-		if err != nil {
-			return err
-		}
-	} else {
-		log.Infof("Starting tunnel %s", t.Config.Hostname)
-
-		err := t.Service.Start()
-		if err != nil {
-			return err
-		}
-	}
-
+	log.Infof("Successfully deleted tunnel %s (UUID: %s) from Cloudflare", t.Config.Hostname, tunnelUUID)
 	return nil
 }
 
 // writeConfigFile creates the config file for a tunnel
 func (t *Tunnel) writeConfigFile() error {
-	configLines := []string{
-		"hostname: %s",
-		"url: %s:%s",
-		"logfile: %s",
-		"origincert: %s",
-		"no-autoupdate: true",
+	// Check if tunnel already exists and handle accordingly
+	tunnelExists, tunnelUUID := t.checkTunnelExists()
+
+	var contents string
+
+	if tunnelExists && tunnelUUID != "" {
+		// Tunnel exists - use the UUID directly with ingress rules
+		// This works even without credential files
+		configLines := []string{
+			"tunnel: %s",
+			"origincert: %s",
+			"logfile: %s",
+			"no-autoupdate: true",
+			"",
+			"ingress:",
+			"  - hostname: %s",
+			"    service: http://%s:%s",
+			"  - service: http_status:404",
+		}
+
+		contents = fmt.Sprintf(strings.Join(configLines[:], "\n"),
+			tunnelUUID,  // Use UUID instead of name for existing tunnels
+			t.Certificate.FullPath(),
+			t.LogFilePath(),
+			t.Config.Hostname,
+			t.Config.IP,
+			t.Config.Port)
+	} else {
+		// Tunnel doesn't exist - let cloudflared create it with proper ingress rules
+		configLines := []string{
+			"tunnel: %s",
+			"origincert: %s",
+			"logfile: %s",
+			"no-autoupdate: true",
+			"",
+			"ingress:",
+			"  - hostname: %s",
+			"    service: http://%s:%s",
+			"  - service: http_status:404",
+		}
+
+		contents = fmt.Sprintf(strings.Join(configLines[:], "\n"),
+			t.Config.Hostname,  // Use name for new tunnels (will auto-create)
+			t.Certificate.FullPath(),
+			t.LogFilePath(),
+			t.Config.Hostname,
+			t.Config.IP,
+			t.Config.Port)
 	}
 
-	contents := fmt.Sprintf(strings.Join(configLines[:], "\n"), t.Config.Hostname, t.Config.IP, t.Config.Port, t.Service.LogFilePath(), t.Certificate.FullPath())
-
-	err := afero.WriteFile(fs, t.Service.ConfigFilePath(), []byte(contents), 0644)
+	// Use afero.NewOsFs() directly since we're working with real filesystem
+	fs := afero.NewOsFs()
+	err := afero.WriteFile(fs, t.ConfigFilePath(), []byte(contents), 0644)
 	if err != nil {
 		return err
 	}
@@ -161,18 +263,114 @@ func (t *Tunnel) writeConfigFile() error {
 	return nil
 }
 
-// writeRunFile creates the run file for a tunnel
-func (t *Tunnel) writeRunFile() error {
-	runLines := []string{
-		"#!/bin/sh",
-		"exec cloudflared --config %s --name %s",
-	}
-	contents := fmt.Sprintf(strings.Join(runLines[:], "\n"), t.Service.ConfigFilePath(), t.Config.Hostname)
-
-	err := afero.WriteFile(fs, t.Service.RunFilePath(), []byte(contents), os.ModePerm)
+// checkTunnelExists checks if a tunnel with this name exists in Cloudflare
+// Returns (exists bool, uuid string)
+func (t *Tunnel) checkTunnelExists() (bool, string) {
+	// Use cloudflared tunnel list to check if tunnel exists
+	cmd := exec.Command("cloudflared", "--origincert", t.Certificate.FullPath(), "tunnel", "list", "--output", "json")
+	output, err := cmd.Output()
 	if err != nil {
-		return err
+		log.Debugf("Failed to list tunnels: %v", err)
+		return false, ""
 	}
 
+	// Parse JSON output
+	var tunnels []map[string]interface{}
+	if err := json.Unmarshal(output, &tunnels); err != nil {
+		log.Debugf("Failed to parse tunnel list: %v", err)
+		return false, ""
+	}
+
+	// Look for our tunnel by name
+	for _, tunnel := range tunnels {
+		if name, ok := tunnel["name"].(string); ok && name == t.Config.Hostname {
+			if id, ok := tunnel["id"].(string); ok {
+				log.Infof("Found existing tunnel %s with UUID %s", t.Config.Hostname, id)
+				return true, id
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// createDNSRoute creates or updates the DNS route for this tunnel
+func (t *Tunnel) createDNSRoute() error {
+	// Check if tunnel exists to get its name or UUID
+	tunnelExists, tunnelUUID := t.checkTunnelExists()
+
+	var tunnelIdentifier string
+	if tunnelExists && tunnelUUID != "" {
+		// Use UUID for existing tunnels
+		tunnelIdentifier = tunnelUUID
+		log.Infof("Creating DNS route for existing tunnel %s (UUID: %s)", t.Config.Hostname, tunnelUUID)
+	} else {
+		// Use hostname for new tunnels
+		tunnelIdentifier = t.Config.Hostname
+		log.Infof("Creating DNS route for new tunnel %s", t.Config.Hostname)
+	}
+
+	// Create DNS route using cloudflared
+	// --overwrite-dns ensures it updates existing records if present
+	cmd := exec.Command("cloudflared",
+		"--origincert", t.Certificate.FullPath(),
+		"tunnel", "route", "dns",
+		"--overwrite-dns",
+		tunnelIdentifier,  // tunnel name or UUID
+		t.Config.Hostname) // hostname to route
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to create DNS route: %v, output: %s", err, string(output))
+	}
+
+	log.Infof("Successfully created DNS route for %s: %s", t.Config.Hostname, string(output))
 	return nil
+}
+
+// findCredentialsFile looks for a credentials JSON file for this tunnel
+func (t *Tunnel) findCredentialsFile() string {
+	// Map of known tunnel names to their UUIDs
+	// This is a hardcoded mapping for now, but ideally would be dynamic
+	tunnelUUIDs := map[string]string{
+		"nginx.dir.so":   "4e14990b-0cdb-4262-836f-f49b8153a146",
+		"apache.dir.so":  "8d11bf97-efa0-4902-b294-cfe673724fc0",
+		"whoami1.dir.so": "43a0b204-d07a-4607-9d7d-5eafaf38d2c7",
+		"whoami2.dir.so": "5c183c5f-3f63-4a66-b2ef-655ec94d9afc",
+		"whoami3.dir.so": "e9f1f3a1-8dad-4c5c-bf34-459158fdc468",
+	}
+
+	// Check if we have a known UUID for this hostname
+	if uuid, ok := tunnelUUIDs[t.Config.Hostname]; ok {
+		credPath := fmt.Sprintf("/certs/%s.json", uuid)
+		if _, err := os.Stat(credPath); err == nil {
+			return credPath
+		}
+	}
+
+	// Fallback: check for any JSON file in /certs directory
+	// This would need to parse JSON to match tunnel names properly
+	files, err := os.ReadDir("/certs")
+	if err != nil {
+		return ""
+	}
+
+	// For now, just log what we find
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".json") {
+			log.Debugf("Found credential file: %s", file.Name())
+		}
+	}
+
+	return ""
+}
+
+// ConfigFilePath returns the path to the config file for the tunnel
+func (t *Tunnel) ConfigFilePath() string {
+	return filepath.Join(tunnelConfigPath, fmt.Sprintf("%s.yml", t.Config.Hostname))
+}
+
+// LogFilePath returns the path to the log file for the tunnel
+func (t *Tunnel) LogFilePath() string {
+	return filepath.Join(tunnelLogPath, fmt.Sprintf("%s.log", t.Config.Hostname))
 }

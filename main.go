@@ -1,17 +1,31 @@
 package main
 
 import (
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"github.com/op/go-logging"
+
+	"hera/internal/process"
 )
 
 var log = logging.MustGetLogger("hera")
+var processManager *process.ProcessManager
 
 func main() {
 	InitLogger("hera")
 
+	// Initialize process manager
+	processManager = process.NewProcessManager()
+
+	// Setup graceful shutdown handler
+	setupSignalHandlers()
+
 	listener, err := NewListener()
 	if err != nil {
-		log.Errorf("Unable to start: %s", err)
+		log.Fatalf("Unable to start: %s", err)
 	}
 
 	log.Infof("Hera v%s has started", CurrentVersion)
@@ -27,4 +41,33 @@ func main() {
 	}
 
 	listener.Listen()
+}
+
+func setupSignalHandlers() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		sig := <-sigChan
+		log.Infof("Received signal %v, shutting down gracefully...", sig)
+
+		// Stop all tunnels with timeout
+		done := make(chan struct{})
+		go func() {
+			if processManager != nil {
+				processManager.Shutdown()
+			}
+			close(done)
+		}()
+
+		// Wait max 45 seconds for graceful shutdown
+		select {
+		case <-done:
+			log.Info("Shutdown complete")
+		case <-time.After(45 * time.Second):
+			log.Error("Shutdown timeout, forcing exit")
+		}
+
+		os.Exit(0)
+	}()
 }
