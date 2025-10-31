@@ -12,7 +12,8 @@ _This repository started as a fork of [aschzero/hera](https://github.com/aschzer
 
 * Continuously monitors the state of your services for automated tunnel creation.
 * Revives tunnels on running containers when Hera is restarted.
-* Uses the s6 process supervisor to ensure active tunnel processes are kept alive.
+* Automatically cleans up orphaned tunnels from Cloudflare when containers are removed.
+* Uses native Go process management to ensure active tunnel processes are kept alive.
 * Low memory footprint and high performance – services can be accessed through a tunnel within seconds.
 * Requires a minimal amount of configuration so you can get up and running quickly.
 * Supports multiple Cloudflare domains.
@@ -159,6 +160,38 @@ For example, tunnels for `mysite.com` or `blog.mysite.com` will use the certific
 
 If a certificate with a matching domain cannot be found, it will look for `cert.pem` in the same directory as a fallback.
 
+### Garbage Collection
+
+Hera automatically cleans up orphaned tunnels from Cloudflare on startup. Orphaned tunnels occur when containers are removed while Hera is stopped, or if Hera crashes during container shutdown.
+
+**Safety Features:**
+- Only deletes tunnels with zero active connections
+- Only deletes tunnels older than 10 minutes (configurable)
+- Re-verifies tunnels are still orphaned immediately before deletion
+- Never deletes tunnels for running containers
+
+**Configuration:**
+
+```bash
+# Disable garbage collection (enabled by default)
+docker run -e HERA_GC_ENABLED=false ...
+
+# Preview what would be deleted without actually deleting
+docker run -e HERA_GC_DRY_RUN=true ...
+
+# Change minimum tunnel age before deletion (default: 10 minutes)
+docker run -e HERA_GC_MIN_AGE_MINUTES=15 ...
+```
+
+**What Gets Deleted:**
+Tunnels are considered orphaned when:
+- No container exists with matching `hera.hostname` label
+- Tunnel has zero active connections
+- Tunnel is older than the minimum age threshold
+- Tunnel is not in Hera's active registry
+
+⚠️ **Note:** Manually created tunnels (not managed by Hera) are safe from garbage collection if they meet the age and connection requirements. Use `HERA_GC_DRY_RUN=true` to preview deletions before enabling.
+
 ---
 
 ## Examples
@@ -190,6 +223,11 @@ services:
       - /path/to/certs:/certs
     networks:
       - hera
+    environment:
+      # Optional: Configure garbage collection
+      - HERA_GC_ENABLED=true          # Enable/disable GC (default: true)
+      - HERA_GC_MIN_AGE_MINUTES=10    # Minimum tunnel age (default: 10)
+      # - HERA_GC_DRY_RUN=true        # Preview deletions without executing
 
   nginx:
     image: nginx:latest
