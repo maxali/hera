@@ -332,43 +332,6 @@ func (t *Tunnel) createDNSRoute() error {
 	return nil
 }
 
-// findCredentialsFile looks for a credentials JSON file for this tunnel
-func (t *Tunnel) findCredentialsFile() string {
-	// Map of known tunnel names to their UUIDs
-	// This is a hardcoded mapping for now, but ideally would be dynamic
-	tunnelUUIDs := map[string]string{
-		"nginx.dir.so":   "4e14990b-0cdb-4262-836f-f49b8153a146",
-		"apache.dir.so":  "8d11bf97-efa0-4902-b294-cfe673724fc0",
-		"whoami1.dir.so": "43a0b204-d07a-4607-9d7d-5eafaf38d2c7",
-		"whoami2.dir.so": "5c183c5f-3f63-4a66-b2ef-655ec94d9afc",
-		"whoami3.dir.so": "e9f1f3a1-8dad-4c5c-bf34-459158fdc468",
-	}
-
-	// Check if we have a known UUID for this hostname
-	if uuid, ok := tunnelUUIDs[t.Config.Hostname]; ok {
-		credPath := fmt.Sprintf("/certs/%s.json", uuid)
-		if _, err := os.Stat(credPath); err == nil {
-			return credPath
-		}
-	}
-
-	// Fallback: check for any JSON file in /certs directory
-	// This would need to parse JSON to match tunnel names properly
-	files, err := os.ReadDir("/certs")
-	if err != nil {
-		return ""
-	}
-
-	// For now, just log what we find
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".json") {
-			log.Debugf("Found credential file: %s", file.Name())
-		}
-	}
-
-	return ""
-}
-
 // ConfigFilePath returns the path to the config file for the tunnel
 func (t *Tunnel) ConfigFilePath() string {
 	return filepath.Join(tunnelConfigPath, fmt.Sprintf("%s.yml", t.Config.Hostname))
