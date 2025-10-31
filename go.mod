@@ -1,6 +1,6 @@
 module hera
 
-go 1.18
+go 1.23
 
 require (
 	github.com/docker/docker v24.0.7+incompatible

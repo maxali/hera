@@ -1,33 +1,24 @@
 ## Builder image
-FROM golang:1.18.3-alpine AS builder
+FROM golang:1.23-alpine3.20 AS builder
 
 RUN apk add --no-cache ca-certificates git
 
 WORKDIR /src
-
 COPY . .
-
 RUN go mod tidy
-
 RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dist/hera
 
 ## Final image
-FROM alpine:3.8
+FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates tini
 
-RUN curl -L -s https://github.com/just-containers/s6-overlay/releases/download/v1.21.4.0/s6-overlay-amd64.tar.gz \
-  | tar xvzf - -C /
-
-RUN curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 > /bin/cloudflared \
-  && chmod +x /bin/cloudflared
-
-RUN mkdir /lib64 && ln -s /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2
-
-RUN apk del --no-cache curl
+# Download cloudflared
+ADD https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 /bin/cloudflared
+RUN chmod +x /bin/cloudflared
 
 COPY --from=builder /dist/hera /bin/
 
-COPY rootfs /
-
-ENTRYPOINT ["/init"]
+# tini handles PID 1 responsibilities (signal forwarding, zombie reaping)
+# Hera runs as PID 2 and just manages cloudflared processes
+ENTRYPOINT ["/sbin/tini", "--", "/bin/hera"]
