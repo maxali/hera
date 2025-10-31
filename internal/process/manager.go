@@ -91,7 +91,9 @@ func (pm *ProcessManager) Start(hostname string, config *Config) error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
+		if cerr := logFile.Close(); cerr != nil {
+			log.Errorf("failed to close log file for %s: %v", hostname, cerr)
+		}
 		return fmt.Errorf("failed to start %s: %w", hostname, err)
 	}
 
@@ -175,7 +177,9 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	// Close old log file before opening new one to prevent FD leak
 	ps.mu.Lock()
 	if ps.logFile != nil {
-		ps.logFile.Close()
+		if cerr := ps.logFile.Close(); cerr != nil {
+			log.Errorf("failed to close log file for %s: %v", hostname, cerr)
+		}
 	}
 	ps.mu.Unlock()
 
@@ -194,7 +198,9 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
+		if cerr := logFile.Close(); cerr != nil {
+			log.Errorf("failed to close log file for %s: %v", hostname, cerr)
+		}
 		log.Errorf("Failed to restart %s: %v", hostname, err)
 
 		ps.mu.Lock()
@@ -236,7 +242,9 @@ func (pm *ProcessManager) Stop(hostname string) error {
 		// Close log file even if process already stopped
 		ps.mu.Lock()
 		if ps.logFile != nil {
-			ps.logFile.Close()
+			if cerr := ps.logFile.Close(); cerr != nil {
+				log.Errorf("failed to close log file for %s: %v", hostname, cerr)
+			}
 			ps.logFile = nil
 		}
 		ps.mu.Unlock()
@@ -292,7 +300,9 @@ func (pm *ProcessManager) Stop(hostname string) error {
 	// Close log file to prevent file descriptor leak
 	ps.mu.Lock()
 	if ps.logFile != nil {
-		ps.logFile.Close()
+		if cerr := ps.logFile.Close(); cerr != nil {
+			log.Errorf("failed to close log file for %s: %v", hostname, cerr)
+		}
 		ps.logFile = nil
 	}
 	ps.mu.Unlock()
