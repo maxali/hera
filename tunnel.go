@@ -227,7 +227,7 @@ func (t *Tunnel) writeConfigFile() error {
 			"  - service: http_status:404",
 		}
 
-		contents = fmt.Sprintf(strings.Join(configLines[:], "\n"),
+		contents = fmt.Sprintf(strings.Join(configLines, "\n"),
 			tunnelUUID,  // Use UUID instead of name for existing tunnels
 			t.Certificate.FullPath(),
 			t.LogFilePath(),
@@ -248,7 +248,7 @@ func (t *Tunnel) writeConfigFile() error {
 			"  - service: http_status:404",
 		}
 
-		contents = fmt.Sprintf(strings.Join(configLines[:], "\n"),
+		contents = fmt.Sprintf(strings.Join(configLines, "\n"),
 			t.Config.Hostname,  // Use name for new tunnels (will auto-create)
 			t.Certificate.FullPath(),
 			t.LogFilePath(),
