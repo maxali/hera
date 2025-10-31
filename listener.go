@@ -183,6 +183,7 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 		if minutes, err := strconv.Atoi(env); err == nil {
 			if minutes < 1 {
 				log.Warningf("Invalid HERA_GC_MIN_AGE_MINUTES=%d (must be >= 1), using default: 10", minutes)
+				minAgeMinutes = 10
 			} else if minutes > 1440 {
 				log.Warningf("HERA_GC_MIN_AGE_MINUTES=%d seems excessive (>24h), using anyway", minutes)
 				minAgeMinutes = minutes
