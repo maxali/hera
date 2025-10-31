@@ -1,21 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/afero"
 	"hera/internal/process"
 )
 
 var (
-	registry = make(map[string]*Tunnel)
+	registry         = make(map[string]*Tunnel)
+	registryMu       sync.RWMutex // Protects registry from concurrent access
 	tunnelConfigPath = "/etc/hera/tunnels"
-	tunnelLogPath = "/var/log/hera"
+	tunnelLogPath    = "/var/log/hera"
 )
 
 // Tunnel holds the corresponding config and certificate for a tunnel
@@ -41,41 +45,41 @@ func NewTunnel(config *TunnelConfig, certificate *Certificate) *Tunnel {
 	return tunnel
 }
 
-// GetTunnelForHost returns the tunnel for a given hostname.
-// An error is returned if a tunnel is not found.
+// GetTunnelForHost returns the tunnel for a given hostname (thread-safe)
 func GetTunnelForHost(hostname string) (*Tunnel, error) {
-	tunnel, ok := registry[hostname]
+	registryMu.RLock()
+	defer registryMu.RUnlock()
 
+	tunnel, ok := registry[hostname]
 	if !ok {
 		return nil, fmt.Errorf("No tunnel exists for %s", hostname)
 	}
-
 	return tunnel, nil
 }
 
-// RegisterTunnel adds a tunnel to the registry
+// RegisterTunnel adds a tunnel to the registry (thread-safe)
 func RegisterTunnel(hostname string, tunnel *Tunnel) error {
-	_, ok := registry[hostname]
+	registryMu.Lock()
+	defer registryMu.Unlock()
 
+	_, ok := registry[hostname]
 	if ok {
 		return fmt.Errorf("Tunnel already exists for %s", hostname)
 	}
-
 	registry[hostname] = tunnel
-
 	return nil
 }
 
-// DeregisterTunnel removes a tunnel from the registry
+// DeregisterTunnel removes a tunnel from the registry (thread-safe)
 func DeregisterTunnel(hostname string) error {
-	_, ok := registry[hostname]
+	registryMu.Lock()
+	defer registryMu.Unlock()
 
+	_, ok := registry[hostname]
 	if !ok {
 		return fmt.Errorf("No tunnel registered for %s", hostname)
 	}
-
 	delete(registry, hostname)
-
 	return nil
 }
 
@@ -373,4 +377,143 @@ func (t *Tunnel) ConfigFilePath() string {
 // LogFilePath returns the path to the log file for the tunnel
 func (t *Tunnel) LogFilePath() string {
 	return filepath.Join(tunnelLogPath, fmt.Sprintf("%s.log", t.Config.Hostname))
+}
+
+// TunnelInfo holds basic tunnel information from Cloudflare
+type TunnelInfo struct {
+	ID          string
+	Name        string
+	Connections int       // Count of active connections
+	CreatedAt   time.Time
+	DeletedAt   time.Time // Non-zero if tunnel is deleted
+}
+
+// Connection represents a single tunnel connection from Cloudflare
+type Connection struct {
+	ColoName           string `json:"colo_name"`
+	ID                 string `json:"id"`
+	IsPendingReconnect bool   `json:"is_pending_reconnect"`
+	OriginIP           string `json:"origin_ip"`
+	OpenedAt           string `json:"opened_at"`
+}
+
+// TunnelListResponse matches the actual JSON structure from cloudflared
+// Based on verified output from: cloudflared tunnel list --output json
+type TunnelListResponse struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	CreatedAt   string       `json:"created_at"`
+	DeletedAt   string       `json:"deleted_at"`
+	Connections []Connection `json:"connections"`
+}
+
+// ListAllCloudflaredTunnels queries Cloudflare for all tunnels
+// Returns only active (non-deleted) tunnels with proper error handling
+func ListAllCloudflaredTunnels(certPath string) ([]TunnelInfo, error) {
+	// Create context with 30-second timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "cloudflared",
+		"--origincert", certPath,
+		"tunnel", "list",
+		"--output", "json")
+
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("cloudflared tunnel list timed out after 30s")
+		}
+		return nil, fmt.Errorf("failed to list tunnels: %w", err)
+	}
+
+	// Use strongly-typed struct for JSON parsing
+	var rawTunnels []TunnelListResponse
+	if err := json.Unmarshal(output, &rawTunnels); err != nil {
+		return nil, fmt.Errorf("failed to parse tunnel list: %w", err)
+	}
+
+	tunnels := make([]TunnelInfo, 0, len(rawTunnels))
+	for _, raw := range rawTunnels {
+		tunnel := TunnelInfo{
+			ID:          raw.ID,
+			Name:        raw.Name,
+			Connections: len(raw.Connections),
+		}
+
+		// Parse created_at timestamp (RFC3339 format) - REQUIRED for age check
+		if raw.CreatedAt != "" && raw.CreatedAt != "0001-01-01T00:00:00Z" {
+			t, err := time.Parse(time.RFC3339, raw.CreatedAt)
+			if err != nil {
+				log.Warningf("Failed to parse created_at for tunnel %s: %v - SKIPPING for safety", raw.Name, err)
+				// CRITICAL: Skip tunnels with unparseable timestamps to prevent bypassing age check
+				continue
+			}
+			tunnel.CreatedAt = t
+		} else {
+			// CRITICAL: Skip tunnels without valid created_at to prevent bypassing age check
+			log.Warningf("Tunnel %s has no valid created_at timestamp - SKIPPING for safety", raw.Name)
+			continue
+		}
+
+		// Check if tunnel is deleted using robust detection
+		// A tunnel is deleted if deleted_at is set to a real timestamp (not zero time)
+		if raw.DeletedAt != "" && raw.DeletedAt != "0001-01-01T00:00:00Z" {
+			t, err := time.Parse(time.RFC3339, raw.DeletedAt)
+			if err == nil && !t.IsZero() && t.Year() > 1 {
+				tunnel.DeletedAt = t
+				// Skip deleted tunnels - they're already cleaned up
+				log.Debugf("Skipping deleted tunnel %s (deleted at %s)",
+					raw.Name, raw.DeletedAt)
+				continue
+			}
+		}
+
+		tunnels = append(tunnels, tunnel)
+	}
+
+	return tunnels, nil
+}
+
+// DeleteTunnelByName deletes a tunnel from Cloudflare
+// Idempotent: returns success if tunnel doesn't exist
+// NOTE: tunnelName and certPath come from trusted sources (Cloudflare API and local filesystem)
+// but input validation is added for defense in depth (Issue #27)
+func DeleteTunnelByName(tunnelName string, certPath string) error {
+	// Validate inputs to prevent command injection (defense in depth)
+	if tunnelName == "" || strings.Contains(tunnelName, "..") || strings.ContainsAny(tunnelName, ";&|`$") {
+		return fmt.Errorf("invalid tunnel name: %s", tunnelName)
+	}
+	if certPath == "" || strings.Contains(certPath, "..") {
+		return fmt.Errorf("invalid certificate path: %s", certPath)
+	}
+
+	// Create context with 30-second timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "cloudflared",
+		"--origincert", certPath,
+		"tunnel", "delete",
+		"-f", // Force delete without confirmation
+		tunnelName)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("cloudflared tunnel delete timed out after 30s for %s", tunnelName)
+		}
+		outputStr := string(output)
+		// Idempotent: treat "already deleted" as success
+		if strings.Contains(outputStr, "not found") ||
+			strings.Contains(outputStr, "does not exist") {
+			log.Debugf("Tunnel %s already deleted", tunnelName)
+			return nil
+		}
+		return fmt.Errorf("failed to delete tunnel %s: %w, output: %s",
+			tunnelName, err, outputStr)
+	}
+
+	log.Infof("Deleted orphaned tunnel: %s", tunnelName)
+	return nil
 }

@@ -40,6 +40,24 @@ func main() {
 		log.Error(err.Error())
 	}
 
+	// Run garbage collection for orphaned tunnels
+	// Check if GC is enabled (default: enabled)
+	gcEnabled := os.Getenv("HERA_GC_ENABLED")
+	if gcEnabled != "false" {
+		// Check for dry-run mode
+		if os.Getenv("HERA_GC_DRY_RUN") == "true" {
+			log.Info("Running garbage collection in DRY-RUN mode (no tunnels will be deleted)")
+		}
+
+		err = listener.GarbageCollectOrphanedTunnels()
+		if err != nil {
+			log.Error(err.Error())
+			// Don't fail startup on GC errors
+		}
+	} else {
+		log.Info("Garbage collection disabled via HERA_GC_ENABLED=false")
+	}
+
 	listener.Listen()
 }
 

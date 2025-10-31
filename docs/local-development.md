@@ -55,6 +55,26 @@ $ HOSTNAME=mysite.com make tunnel
 docker run --rm --label hera.hostname=mysite.com --label hera.port=80 --network=hera nginx
 ```
 
+## Testing Garbage Collection
+
+To test garbage collection behavior:
+
+```bash
+# Run Hera in dry-run mode to preview what would be deleted
+docker run --rm --name=hera --network=hera \
+  -e HERA_GC_DRY_RUN=true \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/development/hera/certs:/certs \
+  hera
+
+# Run with custom minimum age (5 minutes for faster testing)
+docker run --rm --name=hera --network=hera \
+  -e HERA_GC_MIN_AGE_MINUTES=5 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/development/hera/certs:/certs \
+  hera
+```
+
 ## Testing
 
 Run `make test` to run the unit tests. `make test` uses the first stage of the Dockerfile to create a "builder" image and then runs the tests in a temporary container.
