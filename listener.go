@@ -21,7 +21,7 @@ type Listener struct {
 func NewListener() (*Listener, error) {
 	client, err := NewClient()
 	if err != nil {
-		log.Errorf("Unable to connect to Docker: %s", err)
+		log.Error("Unable to connect to Docker", "error", err)
 		return nil, err
 	}
 
@@ -65,7 +65,7 @@ func (l *Listener) Listen() {
 
 		case err := <-errs:
 			if err != nil && err != io.EOF {
-				log.Error(err.Error())
+				log.Error("Docker event error", "error", err)
 			}
 		}
 	}
@@ -93,12 +93,12 @@ func (l *Listener) GarbageCollectOrphanedTunnels() error {
 	// Get all certificates to process each domain independently
 	certs, err := l.getAllCertificates()
 	if err != nil {
-		log.Warningf("Failed to get certificates: %v", err)
+		log.Warn("Failed to get certificates", "error", err)
 		return nil // Don't fail startup on GC errors
 	}
 
 	if len(certs) == 0 {
-		log.Warning("No certificates found, skipping garbage collection")
+		log.Warn("No certificates found, skipping garbage collection")
 		return nil
 	}
 
@@ -114,7 +114,7 @@ func (l *Listener) GarbageCollectOrphanedTunnels() error {
 		go func(c *Certificate) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Errorf("Panic in GC for certificate %s: %v", c.Name, r)
+					log.Error("Panic in GC for certificate", "certificate", c.Name, "panic", r)
 					// Send empty result to prevent blocking
 					results <- gcResult{certName: c.Name, failed: 1}
 				}
@@ -129,7 +129,7 @@ func (l *Listener) GarbageCollectOrphanedTunnels() error {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Errorf("Panic in GC result collector: %v", r)
+				log.Error("Panic in GC result collector", "panic", r)
 			}
 			close(results)
 		}()
@@ -142,15 +142,13 @@ func (l *Listener) GarbageCollectOrphanedTunnels() error {
 	totalScanned := 0
 
 	for result := range results {
-		log.Infof("Certificate %s: scanned=%d, deleted=%d, failed=%d",
-			result.certName, result.scanned, result.deleted, result.failed)
+		log.Info("Certificate GC results", "certificate", result.certName, "scanned", result.scanned, "deleted", result.deleted, "failed", result.failed)
 		totalDeleted += result.deleted
 		totalFailed += result.failed
 		totalScanned += result.scanned
 	}
 
-	log.Infof("Garbage collection complete: scanned %d tunnels, deleted %d, failed %d",
-		totalScanned, totalDeleted, totalFailed)
+	log.Info("Garbage collection complete", "scanned", totalScanned, "deleted", totalDeleted, "failed", totalFailed)
 
 	return nil
 }
@@ -163,12 +161,12 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 		certName: cert.Name,
 	}
 
-	log.Infof("Processing certificate: %s", cert.Name)
+	log.Info("Processing certificate", "name", cert.Name)
 
 	// List all tunnels for this certificate
 	allTunnels, err := ListAllCloudflaredTunnels(cert.FullPath())
 	if err != nil {
-		log.Errorf("Failed to list tunnels for %s: %v", cert.Name, err)
+		log.Error("Failed to list tunnels for certificate", "certificate", cert.Name, "error", err)
 		return result
 	}
 
@@ -182,20 +180,20 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 	if env := os.Getenv("HERA_GC_MIN_AGE_MINUTES"); env != "" {
 		if minutes, err := strconv.Atoi(env); err == nil {
 			if minutes < 1 {
-				log.Warningf("Invalid HERA_GC_MIN_AGE_MINUTES=%d (must be >= 1), using default: 10", minutes)
+				log.Warn("Invalid HERA_GC_MIN_AGE_MINUTES (must be >= 1), using default", "value", minutes, "default", 10)
 				minAgeMinutes = 10
 			} else if minutes > 1440 {
-				log.Warningf("HERA_GC_MIN_AGE_MINUTES=%d seems excessive (>24h), using anyway", minutes)
+				log.Warn("HERA_GC_MIN_AGE_MINUTES seems excessive (>24h), using anyway", "minutes", minutes)
 				minAgeMinutes = minutes
 			} else {
 				minAgeMinutes = minutes
 			}
 		} else {
-			log.Warningf("Invalid HERA_GC_MIN_AGE_MINUTES=%s (not a number), using default: 10", env)
+			log.Warn("Invalid HERA_GC_MIN_AGE_MINUTES (not a number), using default", "value", env, "default", 10)
 		}
 	}
 	minAge := time.Duration(minAgeMinutes) * time.Minute
-	log.Infof("Using minimum tunnel age: %s", minAge)
+	log.Info("Using minimum tunnel age", "age", minAge)
 
 	// Identify orphaned tunnels with safety checks
 	orphanedTunnels := make([]TunnelInfo, 0)
@@ -205,28 +203,26 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 		// This prevents Hera from deleting manually created tunnels or tunnels
 		// created by other tools/processes
 		if !isHeraTunnel(tunnel.Name) {
-			log.Debugf("Skipping tunnel %s - not created by Hera (no hera- prefix)", tunnel.Name)
+			log.Debug("Skipping tunnel - not created by Hera (no hera- prefix)", "tunnel", tunnel.Name)
 			continue
 		}
 
 		// Skip if tunnel has an active container
 		if expectedTunnels[tunnel.Name] {
-			log.Debugf("Tunnel %s has active container, skipping", tunnel.Name)
+			log.Debug("Tunnel has active container, skipping", "tunnel", tunnel.Name)
 			continue
 		}
 
 		// Safety check 1: Only delete tunnels with zero connections
 		if tunnel.Connections > 0 {
-			log.Warningf("Skipping tunnel %s - has %d active connections",
-				tunnel.Name, tunnel.Connections)
+			log.Warn("Skipping tunnel - has active connections", "tunnel", tunnel.Name, "connections", tunnel.Connections)
 			continue
 		}
 
 		// Safety check 2: Only delete tunnels older than minimum age
 		if !tunnel.CreatedAt.IsZero() && time.Since(tunnel.CreatedAt) < minAge {
 			age := time.Since(tunnel.CreatedAt).Round(time.Second)
-			log.Infof("Skipping recent tunnel %s (age: %s, min: %s)",
-				tunnel.Name, age, minAge)
+			log.Info("Skipping recent tunnel", "tunnel", tunnel.Name, "age", age, "min_age", minAge)
 			continue
 		}
 
@@ -234,12 +230,11 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 	}
 
 	if len(orphanedTunnels) == 0 {
-		log.Infof("No orphaned tunnels found for certificate %s", cert.Name)
+		log.Info("No orphaned tunnels found for certificate", "certificate", cert.Name)
 		return result
 	}
 
-	log.Infof("Found %d orphaned tunnels to clean up for %s",
-		len(orphanedTunnels), cert.Name)
+	log.Info("Found orphaned tunnels to clean up", "count", len(orphanedTunnels), "certificate", cert.Name)
 
 	// Delete orphaned tunnels in parallel with proper synchronization
 	var wg sync.WaitGroup
@@ -259,7 +254,7 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 			// Safety check 1: Re-verify no container exists for this hostname
 			containers, err := l.Client.ListContainers()
 			if err != nil {
-				log.Errorf("Failed to re-verify containers for %s: %v", t.Name, err)
+				log.Error("Failed to re-verify containers", "tunnel", t.Name, "error", err)
 				mu.Lock()
 				result.failed++
 				mu.Unlock()
@@ -275,7 +270,7 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 				if hostname != "" {
 					expectedTunnelName := getTunnelName(hostname)
 					if expectedTunnelName == t.Name {
-						log.Infof("Tunnel %s now has active container, skipping deletion", t.Name)
+						log.Info("Tunnel now has active container, skipping deletion", "tunnel", t.Name)
 						return // Container started during GC - abort deletion
 					}
 				}
@@ -288,7 +283,7 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 			// NOTE: Registry uses hostname (without prefix) as key
 			hostname := getHostnameFromTunnelName(t.Name)
 			if _, err := GetTunnelForHost(hostname); err == nil {
-				log.Infof("Tunnel %s now in registry, skipping deletion", t.Name)
+				log.Info("Tunnel now in registry, skipping deletion", "tunnel", t.Name)
 				return // Tunnel was registered during GC - abort deletion
 			}
 
@@ -296,7 +291,7 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 			// (double-check against ProcessManager state)
 			// NOTE: ProcessManager uses hostname (without prefix) as key
 			if processManager.IsRunning(hostname) {
-				log.Warningf("Tunnel %s has running process, skipping deletion", t.Name)
+				log.Warn("Tunnel has running process, skipping deletion", "tunnel", t.Name)
 				return // Process is active - abort deletion
 			}
 
@@ -304,20 +299,18 @@ func (l *Listener) garbageCollectForCertificate(cert *Certificate,
 			dryRun := os.Getenv("HERA_GC_DRY_RUN") == "true"
 
 			if dryRun {
-				log.Infof("[DRY-RUN] Would delete orphaned tunnel: %s (age: %s, connections: %d)",
-					t.Name, age, t.Connections)
+				log.Info("[DRY-RUN] Would delete orphaned tunnel", "tunnel", t.Name, "age", age, "connections", t.Connections)
 				mu.Lock()
 				result.deleted++ // Count as "would delete"
 				mu.Unlock()
 			} else {
-				log.Infof("Deleting orphaned tunnel: %s (age: %s, connections: %d)",
-					t.Name, age, t.Connections)
+				log.Info("Deleting orphaned tunnel", "tunnel", t.Name, "age", age, "connections", t.Connections)
 
 				if err := DeleteTunnelByName(t.Name, cert.FullPath()); err != nil {
 					mu.Lock()
 					result.failed++
 					mu.Unlock()
-					log.Errorf("Failed to delete orphaned tunnel %s: %v", t.Name, err)
+					log.Error("Failed to delete orphaned tunnel", "tunnel", t.Name, "error", err)
 				} else {
 					mu.Lock()
 					result.deleted++
@@ -337,7 +330,7 @@ func (l *Listener) getExpectedTunnels() map[string]bool {
 
 	containers, err := l.Client.ListContainers()
 	if err != nil {
-		log.Errorf("Failed to list containers: %v", err)
+		log.Error("Failed to list containers", "error", err)
 		return expectedTunnels
 	}
 
@@ -364,7 +357,7 @@ func (l *Listener) getExpectedTunnels() map[string]bool {
 
 			container, err := l.Client.Inspect(containerID)
 			if err != nil {
-				log.Debugf("Failed to inspect container %s: %v", containerID, err)
+				log.Debug("Failed to inspect container", "container_id", containerID, "error", err)
 				return
 			}
 
@@ -387,7 +380,7 @@ func (l *Listener) getExpectedTunnels() map[string]bool {
 		expectedTunnels[tunnelName] = true
 	}
 
-	log.Infof("Found %d containers with hera.hostname labels", len(expectedTunnels))
+	log.Info("Found containers with hera.hostname labels", "count", len(expectedTunnels))
 	return expectedTunnels
 }
 
@@ -404,12 +397,12 @@ func (l *Listener) getAllCertificates() ([]*Certificate, error) {
 	for _, cert := range certs {
 		// Verify certificate file exists and is readable
 		if exists, err := afero.Exists(l.Fs, cert.FullPath()); !exists || err != nil {
-			log.Warningf("Certificate %s is not accessible: %v", cert.Name, err)
+			log.Warn("Certificate is not accessible", "certificate", cert.Name, "error", err)
 			continue
 		}
 		validCerts = append(validCerts, cert)
 	}
 
-	log.Infof("Found %d valid certificates in %s", len(validCerts), CertificatePath)
+	log.Info("Found valid certificates", "count", len(validCerts), "path", CertificatePath)
 	return validCerts, nil
 }

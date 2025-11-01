@@ -61,7 +61,7 @@ func VerifyCertificates(fs afero.Fs) error {
 	}
 
 	for _, cert := range certs {
-		log.Infof("Found certificate: %s", cert.Name)
+		log.Info("Found certificate", "name", cert.Name)
 	}
 
 	return nil
@@ -97,7 +97,7 @@ func (c *Certificate) belongsToHost(host string) bool {
 func (c *Certificate) isExist() bool {
 	exists, err := afero.Exists(c.Fs, c.FullPath())
 	if err != nil {
-		log.Errorf("Unable to check certificate: %s", err)
+		log.Error("Unable to check certificate", "error", err, "path", c.FullPath())
 	}
 
 	return exists

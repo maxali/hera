@@ -45,19 +45,19 @@ func NewHandler(client *Client) *Handler {
 func (h *Handler) HandleEvent(event events.Message) {
 	switch status := event.Status; status {
 	case "start":
-		log.Debugf("Received START event for container %s", event.ID[:12])
+		log.Debug("Received START event", "container_id", event.ID[:12])
 		err := h.handleStartEvent(event)
 		if err != nil {
-			log.Error(err.Error())
+			log.Error("Failed to handle START event", "error", err, "container_id", event.ID[:12])
 		}
 
 	case "die":
-		log.Infof("Received DIE event for container %s", event.ID[:12])
+		log.Info("Received DIE event", "container_id", event.ID[:12])
 		err := h.handleDieEvent(event)
 		if err != nil {
-			log.Errorf("Failed to handle DIE event for %s: %v", event.ID[:12], err)
+			log.Error("Failed to handle DIE event", "error", err, "container_id", event.ID[:12])
 		} else {
-			log.Infof("Successfully handled DIE event for %s", event.ID[:12])
+			log.Info("Successfully handled DIE event", "container_id", event.ID[:12])
 		}
 	}
 }
@@ -96,9 +96,9 @@ func (h *Handler) handleStartEvent(event events.Message) error {
 	containerRegistryMu.Lock()
 	containerRegistry[container.ID] = hostname
 	containerRegistryMu.Unlock()
-	log.Debugf("Registered container %s with hostname %s", container.ID[:12], hostname)
+	log.Debug("Registered container with hostname", "container_id", container.ID[:12], "hostname", hostname)
 
-	log.Infof("Container found, connecting to %s...", container.ID[:12])
+	log.Info("Container found, connecting...", "container_id", container.ID[:12])
 
 	ip, err := h.resolveHostname(container)
 	if err != nil {
@@ -122,9 +122,9 @@ func (h *Handler) handleStartEvent(event events.Message) error {
 	// Priority: container label > environment variable
 	tunnel.DNSCleanupEnabled = getDNSCleanupEnabled(container)
 	if tunnel.DNSCleanupEnabled {
-		log.Infof("DNS cleanup enabled for %s", hostname)
+		log.Info("DNS cleanup enabled", "hostname", hostname)
 	} else {
-		log.Debugf("DNS cleanup disabled for %s", hostname)
+		log.Debug("DNS cleanup disabled", "hostname", hostname)
 	}
 
 	tunnel.Start()
@@ -142,7 +142,7 @@ func (h *Handler) handleDieEvent(event events.Message) error {
 	if err != nil {
 		// Container already removed (e.g., docker-compose down)
 		// Fall back to container registry lookup
-		log.Infof("Container %s already removed, checking registry for hostname", event.ID[:12])
+		log.Info("Container already removed, checking registry for hostname", "container_id", event.ID[:12])
 
 		containerRegistryMu.RLock()
 		var ok bool
@@ -150,16 +150,16 @@ func (h *Handler) handleDieEvent(event events.Message) error {
 		containerRegistryMu.RUnlock()
 
 		if !ok {
-			log.Warningf("Container %s not found in registry, unable to clean up tunnel", event.ID[:12])
+			log.Warn("Container not found in registry, unable to clean up tunnel", "container_id", event.ID[:12])
 			return nil
 		}
 
-		log.Infof("Found hostname %s in registry for removed container %s", hostname, event.ID[:12])
+		log.Info("Found hostname in registry for removed container", "hostname", hostname, "container_id", event.ID[:12])
 	} else {
 		// Container still exists, get hostname from labels
 		hostname = getLabel("hera.hostname", container)
 		if hostname == "" {
-			log.Debugf("Container %s has no hera.hostname label, skipping", event.ID[:12])
+			log.Debug("Container has no hera.hostname label, skipping", "container_id", event.ID[:12])
 			// Clean up registry entry even though no tunnel exists
 			containerRegistryMu.Lock()
 			delete(containerRegistry, event.ID)
@@ -168,11 +168,11 @@ func (h *Handler) handleDieEvent(event events.Message) error {
 		}
 	}
 
-	log.Infof("Container %s stopped, looking up tunnel for hostname: %s", event.ID[:12], hostname)
+	log.Info("Container stopped, looking up tunnel", "container_id", event.ID[:12], "hostname", hostname)
 
 	tunnel, err := GetTunnelForHost(hostname)
 	if err != nil {
-		log.Errorf("Failed to find tunnel for %s: %v", hostname, err)
+		log.Error("Failed to find tunnel", "hostname", hostname, "error", err)
 		// Clean up registry entry even if tunnel lookup fails
 		containerRegistryMu.Lock()
 		delete(containerRegistry, event.ID)
@@ -180,20 +180,20 @@ func (h *Handler) handleDieEvent(event events.Message) error {
 		return err
 	}
 
-	log.Infof("Found tunnel for %s, calling tunnel.Stop() to delete from Cloudflare", hostname)
+	log.Info("Found tunnel, calling Stop() to delete from Cloudflare", "hostname", hostname)
 	err = tunnel.Stop()
 	if err != nil {
-		log.Errorf("Failed to stop tunnel for %s: %v", hostname, err)
+		log.Error("Failed to stop tunnel", "hostname", hostname, "error", err)
 		// Don't return error - still clean up registry entry
 	} else {
-		log.Infof("Successfully stopped and deleted tunnel for %s", hostname)
+		log.Info("Successfully stopped and deleted tunnel", "hostname", hostname)
 	}
 
 	// Clean up container registry entry
 	containerRegistryMu.Lock()
 	delete(containerRegistry, event.ID)
 	containerRegistryMu.Unlock()
-	log.Debugf("Removed container %s from registry", event.ID[:12])
+	log.Debug("Removed container from registry", "container_id", event.ID[:12])
 
 	return err
 }
@@ -213,7 +213,7 @@ func (h *Handler) resolveHostname(container types.ContainerJSON) (string, error)
 
 		if err != nil {
 			time.Sleep(2 * time.Second)
-			log.Infof("Unable to connect, retrying... (%d/%d)", attempts, maxAttempts)
+			log.Info("Unable to connect, retrying...", "attempt", attempts, "max_attempts", maxAttempts, "hostname", container.Config.Hostname)
 
 			continue
 		}
@@ -269,31 +269,31 @@ func getDNSCleanupEnabled(container types.ContainerJSON) bool {
 	if labelValue != "" {
 		// Parse label value as boolean
 		if labelValue == "true" || labelValue == "1" || labelValue == "yes" {
-			log.Debugf("DNS cleanup enabled via container label for %s", container.ID[:12])
+			log.Debug("DNS cleanup enabled via container label", "container_id", container.ID[:12])
 			return true
 		}
 		if labelValue == "false" || labelValue == "0" || labelValue == "no" {
-			log.Debugf("DNS cleanup disabled via container label for %s", container.ID[:12])
+			log.Debug("DNS cleanup disabled via container label", "container_id", container.ID[:12])
 			return false
 		}
-		log.Warningf("Invalid hera.dns.cleanup label value '%s' for container %s, falling back to environment variable", labelValue, container.ID[:12])
+		log.Warn("Invalid hera.dns.cleanup label value, falling back to environment variable", "value", labelValue, "container_id", container.ID[:12])
 	}
 
 	// Check environment variable (lower priority)
 	envValue := os.Getenv("CLOUDFLARE_DNS_CLEANUP_ENABLED")
 	if envValue != "" {
 		if envValue == "true" || envValue == "1" || envValue == "yes" {
-			log.Debugf("DNS cleanup enabled via environment variable for %s", container.ID[:12])
+			log.Debug("DNS cleanup enabled via environment variable", "container_id", container.ID[:12])
 			return true
 		}
 		if envValue == "false" || envValue == "0" || envValue == "no" {
-			log.Debugf("DNS cleanup disabled via environment variable for %s", container.ID[:12])
+			log.Debug("DNS cleanup disabled via environment variable", "container_id", container.ID[:12])
 			return false
 		}
-		log.Warningf("Invalid CLOUDFLARE_DNS_CLEANUP_ENABLED value '%s', defaulting to false", envValue)
+		log.Warn("Invalid CLOUDFLARE_DNS_CLEANUP_ENABLED value, defaulting to false", "value", envValue)
 	}
 
 	// Default to false if neither is set
-	log.Debugf("DNS cleanup disabled (default) for %s", container.ID[:12])
+	log.Debug("DNS cleanup disabled (default)", "container_id", container.ID[:12])
 	return false
 }

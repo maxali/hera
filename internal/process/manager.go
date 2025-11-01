@@ -4,16 +4,13 @@ package process
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/op/go-logging"
 )
-
-var log = logging.MustGetLogger("hera")
 
 type ProcessManager struct {
 	processes map[string]*ProcessState
@@ -92,7 +89,7 @@ func (pm *ProcessManager) Start(hostname string, config *Config) error {
 
 	if err := cmd.Start(); err != nil {
 		if err := logFile.Close(); err != nil {
-			log.Errorf("failed to close log file for %s: %v", hostname, err)
+			slog.Error("Failed to close log file", "hostname", hostname, "error", err)
 		}
 		return fmt.Errorf("failed to start %s: %w", hostname, err)
 	}
@@ -110,7 +107,7 @@ func (pm *ProcessManager) Start(hostname string, config *Config) error {
 	pm.processes[hostname] = ps
 	pm.mu.Unlock()
 
-	log.Infof("Started process %s (PID: %d)", hostname, cmd.Process.Pid)
+	slog.Info("Started process", "hostname", hostname, "pid", cmd.Process.Pid)
 
 	// Monitor process and restart if it dies
 	go pm.supervise(hostname, ps)
@@ -124,7 +121,7 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	// Check if shutdown was requested
 	select {
 	case <-pm.ctx.Done():
-		log.Infof("Process %s stopped due to shutdown", hostname)
+		slog.Info("Process stopped due to shutdown", "hostname", hostname)
 		return
 	default:
 	}
@@ -132,13 +129,13 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	ps.mu.Lock()
 	if ps.state == StateStopped {
 		ps.mu.Unlock()
-		log.Infof("Process %s stopped intentionally", hostname)
+		slog.Info("Process stopped intentionally", "hostname", hostname)
 		return
 	}
 
 	// Reset restart counter if process ran successfully for 5+ minutes
 	if time.Since(ps.lastRestart) > 5*time.Minute {
-		log.Infof("Process %s ran successfully for 5+ minutes, resetting restart counter", hostname)
+		slog.Info("Process ran successfully for 5+ minutes, resetting restart counter", "hostname", hostname)
 		ps.restartCount = 0
 		ps.backoff = time.Second
 	}
@@ -148,8 +145,7 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	if ps.restartCount > 10 {
 		ps.state = StateFatal
 		ps.mu.Unlock()
-		log.Errorf("Process %s failed too many times (attempt %d), marking as FATAL",
-			hostname, ps.restartCount)
+		slog.Error("Process failed too many times, marking as FATAL", "hostname", hostname, "attempt", ps.restartCount)
 		return
 	}
 
@@ -161,15 +157,14 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	}
 	ps.mu.Unlock()
 
-	log.Errorf("Process %s exited with error: %v, restarting in %v (attempt %d)",
-		hostname, err, backoffDuration, ps.restartCount)
+	slog.Error("Process exited, restarting after backoff", "hostname", hostname, "error", err, "backoff", backoffDuration, "attempt", ps.restartCount)
 
 	// Wait before restarting (with context cancellation support)
 	select {
 	case <-time.After(backoffDuration):
 		// Continue with restart
 	case <-pm.ctx.Done():
-		log.Infof("Restart of %s cancelled due to shutdown", hostname)
+		slog.Info("Restart cancelled due to shutdown", "hostname", hostname)
 		return
 	}
 
@@ -178,14 +173,14 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	ps.mu.Lock()
 	if ps.logFile != nil {
 		if err := ps.logFile.Close(); err != nil {
-			log.Errorf("failed to close log file for %s: %v", hostname, err)
+			slog.Error("Failed to close log file", "hostname", hostname, "error", err)
 		}
 	}
 	ps.mu.Unlock()
 
 	logFile, err := os.OpenFile(ps.config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		log.Errorf("Failed to open log file for %s: %v", hostname, err)
+		slog.Error("Failed to open log file", "hostname", hostname, "error", err)
 		return
 	}
 
@@ -199,9 +194,9 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 
 	if err := cmd.Start(); err != nil {
 		if err := logFile.Close(); err != nil {
-			log.Errorf("failed to close log file for %s: %v", hostname, err)
+			slog.Error("Failed to close log file", "hostname", hostname, "error", err)
 		}
-		log.Errorf("Failed to restart %s: %v", hostname, err)
+		slog.Error("Failed to restart process", "hostname", hostname, "error", err)
 
 		ps.mu.Lock()
 		ps.cmd = nil // Clear stale process reference
@@ -217,7 +212,7 @@ func (pm *ProcessManager) supervise(hostname string, ps *ProcessState) {
 	ps.lastRestart = time.Now()
 	ps.mu.Unlock()
 
-	log.Infof("Restarted process %s (PID: %d, attempt %d)", hostname, cmd.Process.Pid, ps.restartCount)
+	slog.Info("Restarted process", "hostname", hostname, "pid", cmd.Process.Pid, "attempt", ps.restartCount)
 
 	// Recursive call with SAME ProcessState
 	go pm.supervise(hostname, ps)
@@ -243,7 +238,7 @@ func (pm *ProcessManager) Stop(hostname string) error {
 		ps.mu.Lock()
 		if ps.logFile != nil {
 			if err := ps.logFile.Close(); err != nil {
-				log.Errorf("failed to close log file for %s: %v", hostname, err)
+				slog.Error("Failed to close log file", "hostname", hostname, "error", err)
 			}
 			ps.logFile = nil
 		}
@@ -256,14 +251,14 @@ func (pm *ProcessManager) Stop(hostname string) error {
 	}
 
 	pid := ps.cmd.Process.Pid
-	log.Infof("Stopping process %s (PID: %d)", hostname, pid)
+	slog.Info("Stopping process", "hostname", hostname, "pid", pid)
 
 	// Try to kill entire process group first (cloudflared might have children)
 	pgid, err := syscall.Getpgid(pid)
 	if err == nil && pgid > 0 {
 		// Kill entire process group with SIGTERM
 		if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
-			log.Errorf("Failed to send SIGTERM to process group %d: %v", pgid, err)
+			slog.Error("Failed to send SIGTERM to process group", "pgid", pgid, "error", err)
 		}
 	} else {
 		// Fallback: kill just the main process
@@ -279,12 +274,12 @@ func (pm *ProcessManager) Stop(hostname string) error {
 	select {
 	case err := <-done:
 		if err != nil {
-			log.Infof("Process %s exited with: %v", hostname, err)
+			slog.Info("Process exited", "hostname", hostname, "error", err)
 		} else {
-			log.Infof("Process %s stopped gracefully", hostname)
+			slog.Info("Process stopped gracefully", "hostname", hostname)
 		}
 	case <-time.After(10 * time.Second):
-		log.Errorf("Process %s didn't exit gracefully, force killing", hostname)
+		slog.Error("Process didn't exit gracefully, force killing", "hostname", hostname)
 
 		// Force kill entire process group
 		if pgid, err := syscall.Getpgid(pid); err == nil && pgid > 0 {
@@ -301,7 +296,7 @@ func (pm *ProcessManager) Stop(hostname string) error {
 	ps.mu.Lock()
 	if ps.logFile != nil {
 		if err := ps.logFile.Close(); err != nil {
-			log.Errorf("failed to close log file for %s: %v", hostname, err)
+			slog.Error("Failed to close log file", "hostname", hostname, "error", err)
 		}
 		ps.logFile = nil
 	}
@@ -316,7 +311,7 @@ func (pm *ProcessManager) Stop(hostname string) error {
 
 // FIXED: Uses context cancellation and concurrent shutdown
 func (pm *ProcessManager) Shutdown() error {
-	log.Info("Shutting down all processes...")
+	slog.Info("Shutting down all processes...")
 
 	// Cancel context to stop all supervise goroutines
 	pm.cancel()
@@ -335,7 +330,7 @@ func (pm *ProcessManager) Shutdown() error {
 		go func(h string) {
 			defer wg.Done()
 			if err := pm.Stop(h); err != nil {
-				log.Errorf("Error stopping %s: %v", h, err)
+				slog.Error("Error stopping process", "hostname", h, "error", err)
 			}
 		}(hostname)
 	}
@@ -349,9 +344,9 @@ func (pm *ProcessManager) Shutdown() error {
 
 	select {
 	case <-done:
-		log.Info("All processes shut down successfully")
+		slog.Info("All processes shut down successfully")
 	case <-time.After(30 * time.Second):
-		log.Error("Shutdown timeout reached, some processes may still be running")
+		slog.Error("Shutdown timeout reached, some processes may still be running")
 	}
 
 	return nil

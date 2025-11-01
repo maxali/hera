@@ -23,11 +23,12 @@ cloudflared processes (children of Hera)
 ### Core Flow
 
 1. **main.go**: Entry point that initializes the logger, ProcessManager, signal handlers, creates a Listener, verifies certificates, revives existing tunnels, runs garbage collection, and starts the event listener
-2. **listener.go**: Manages Docker event listening, coordinates container event handling, and implements garbage collection for orphaned tunnels
-3. **handler.go**: Processes container start/die events and orchestrates tunnel creation/destruction
-4. **tunnel.go**: Core tunnel management - maintains a registry of active tunnels and handles their lifecycle, provides GC helper functions
-5. **internal/process/manager.go**: Native Go process manager that supervises cloudflared processes with automatic restart, exponential backoff, and graceful shutdown
-6. **certificate.go**: Manages Cloudflare certificate discovery and matching for hostnames
+2. **logger.go**: Configures structured logging (slog) with JSON/text format, configurable log levels, writes to both stderr and file
+3. **listener.go**: Manages Docker event listening, coordinates container event handling, and implements garbage collection for orphaned tunnels
+4. **handler.go**: Processes container start/die events and orchestrates tunnel creation/destruction
+5. **tunnel.go**: Core tunnel management - maintains a registry of active tunnels and handles their lifecycle, provides GC helper functions
+6. **internal/process/manager.go**: Native Go process manager that supervises cloudflared processes with automatic restart, exponential backoff, and graceful shutdown
+7. **certificate.go**: Manages Cloudflare certificate discovery and matching for hostnames
 
 ### Key Concepts
 
@@ -35,11 +36,20 @@ cloudflared processes (children of Hera)
 - **Hostname Resolution**: Uses net.LookupHost with retry logic (up to 5 attempts) to resolve container IPs
 - **Certificate Matching**: Certificates must be named `<domain>.pem` (e.g., `mysite.com.pem`) and stored in `/certs`
 - **Tunnel Registry**: In-memory map tracking active tunnels by hostname (tunnel.go:20)
+- **Structured Logging**: Uses Go's slog for production-ready logging:
+  - Configurable log levels (debug, info, warn, error) via `HERA_LOG_LEVEL`
+  - JSON format (default) for log aggregation platforms (ELK, Datadog, Grafana Loki)
+  - Text format option for human-readable console output with clean formatting
+  - Colorized output in text mode for better readability (auto-detects TTY)
+    - DEBUG: Gray, INFO: Blue, WARN: Yellow, ERROR: Red+Bold
+  - Writes to both stderr (for `docker logs`) and file (`/var/log/hera/hera.log`)
+  - All logs use key-value structured fields for machine parsing
+  - Optional source file/line inclusion via `HERA_LOG_SOURCE`
 - **Process Supervision**: Native Go ProcessManager supervises cloudflared processes with:
   - Automatic restart on failure with exponential backoff (1s, 2s, 4s, ... max 60s)
   - Reset restart counter after 5 minutes of stability
   - Fatal state after 10 consecutive failures
-  - Process groups (Setpgid) to kill child processes
+  - Process groups (Setpgid) to kill entire process tree
   - Pdeathsig to prevent orphans if Hera crashes
   - Context-based cancellation for clean shutdown
   - Proper zombie reaping (tini handles this as PID 1)
@@ -110,10 +120,22 @@ Containers must have these Docker labels:
 
 ### Environment Variables
 
-Garbage collection configuration:
-- `HERA_GC_ENABLED`: Enable/disable garbage collection (default: true)
-- `HERA_GC_DRY_RUN`: Preview deletions without executing (default: false)
-- `HERA_GC_MIN_AGE_MINUTES`: Minimum tunnel age before deletion in minutes (default: 10, min: 1)
+**Logging configuration:**
+- `HERA_LOG_LEVEL`: Set log verbosity - `debug`, `info`, `warn`, `error` (default: `info`)
+- `HERA_LOG_FORMAT`: Output format - `json`, `text` (default: `json`)
+  - `json`: Machine-readable format for log aggregation platforms (ELK, Datadog, Grafana Loki)
+  - `text`: Human-readable colorized format with clean output: `2025-10-31T23:49:52Z INFO Message key=value`
+- `HERA_LOG_COLOR`: Colorize console output - `auto`, `true`, `false` (default: `true` for text mode)
+  - Default behavior: Colors enabled for text format, disabled for JSON
+  - `auto`: Enable colors only if stderr is a TTY (terminal detection)
+  - `true`: Always use colors (default for text format)
+  - `false`: Never use colors (useful for log parsers or CI/CD)
+- `HERA_LOG_SOURCE`: Include source file/line in logs - `true`, `false` (default: `false`)
+
+**Garbage collection configuration:**
+- `HERA_GC_ENABLED`: Enable/disable garbage collection (default: `true`)
+- `HERA_GC_DRY_RUN`: Preview deletions without executing (default: `false`)
+- `HERA_GC_MIN_AGE_MINUTES`: Minimum tunnel age before deletion in minutes (default: `10`, min: `1`)
 
 ## Dependencies
 
@@ -121,7 +143,7 @@ Garbage collection configuration:
 - **tini**: Minimal init system for PID 1 (installed from Alpine packages)
 - **cloudflared**: Cloudflare tunnel client (latest binary downloaded in Dockerfile)
 - **afero**: Filesystem abstraction for testability
-- **go-logging**: Structured logging
+- **slog**: Go standard library structured logging (log/slog)
 
 ## Process Manager
 

@@ -6,12 +6,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/op/go-logging"
-
 	"hera/internal/process"
 )
 
-var log = logging.MustGetLogger("hera")
 var processManager *process.ProcessManager
 
 func main() {
@@ -25,20 +22,21 @@ func main() {
 
 	listener, err := NewListener()
 	if err != nil {
-		log.Fatalf("Unable to start: %s", err)
+		log.Error("Unable to start", "error", err)
+		os.Exit(1)
 	}
 
-	log.Infof("Hera v%s has started", CurrentVersion)
-	log.Infof("Tunnel name prefix: 'hera-' (only tunnels with this prefix will be managed)")
+	log.Info("Hera has started", "version", CurrentVersion)
+	log.Info("Tunnel name prefix: 'hera-' (only tunnels with this prefix will be managed)")
 
 	err = VerifyCertificates(listener.Fs)
 	if err != nil {
-		log.Error(err.Error())
+		log.Error("Certificate verification failed", "error", err)
 	}
 
 	err = listener.Revive()
 	if err != nil {
-		log.Error(err.Error())
+		log.Error("Failed to revive tunnels", "error", err)
 	}
 
 	// Run garbage collection for orphaned tunnels
@@ -52,7 +50,7 @@ func main() {
 
 		err = listener.GarbageCollectOrphanedTunnels()
 		if err != nil {
-			log.Error(err.Error())
+			log.Error("Garbage collection failed", "error", err)
 			// Don't fail startup on GC errors
 		}
 	} else {
@@ -68,7 +66,7 @@ func setupSignalHandlers() {
 
 	go func() {
 		sig := <-sigChan
-		log.Infof("Received signal %v, shutting down gracefully...", sig)
+		log.Info("Received shutdown signal, shutting down gracefully...", "signal", sig)
 
 		// Stop all tunnels with timeout
 		done := make(chan struct{})
