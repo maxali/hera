@@ -351,47 +351,74 @@ func (t *Tunnel) writeConfigFile() error {
 // checkTunnelExists checks if a tunnel with this name exists in Cloudflare
 // Returns (exists bool, uuid string)
 // Supports backward compatibility: checks for both prefixed (hera-) and legacy (unprefixed) tunnels
+// Uses cloudflared tunnel info for O(1) direct lookup (much faster than listing all tunnels)
 func (t *Tunnel) checkTunnelExists() (bool, string) {
-	// Use cloudflared tunnel list to check if tunnel exists
-	cmd := exec.Command("cloudflared", "--origincert", t.Certificate.FullPath(), "tunnel", "list", "--output", "json")
-	output, err := cmd.Output()
-	if err != nil {
-		log.Debug("Failed to list tunnels", "error", err)
-		return false, ""
-	}
-
-	// Parse JSON output
-	var tunnels []map[string]interface{}
-	if err := json.Unmarshal(output, &tunnels); err != nil {
-		log.Debug("Failed to parse tunnel list", "error", err)
-		return false, ""
-	}
-
+	// Priority 1: Try prefixed tunnel name first (new format)
 	tunnelName := getTunnelName(t.Config.Hostname)
+	exists, uuid := t.checkSingleTunnelExists(tunnelName)
+	if exists {
+		log.Info("Found existing tunnel", "tunnel_name", tunnelName, "uuid", uuid)
+		return true, uuid
+	}
 
-	for _, tunnel := range tunnels {
-		if name, ok := tunnel["name"].(string); ok {
-			// Priority 1: Check for prefixed tunnel name (new format)
-			if name == tunnelName {
-				if id, ok := tunnel["id"].(string); ok {
-					log.Info("Found existing tunnel", "tunnel_name", tunnelName, "uuid", id)
-					return true, id
-				}
-			}
-
-			// Priority 2: Check for legacy unprefixed tunnel name (backward compatibility)
-			// This allows Hera to adopt existing tunnels created before the prefix was added
-			if name == t.Config.Hostname {
-				if id, ok := tunnel["id"].(string); ok {
-					log.Warn("Found legacy tunnel without prefix - will use it but consider migrating", "name", name, "uuid", id)
-					log.Warn("To migrate, delete the old tunnel and restart the container", "command", fmt.Sprintf("cloudflared tunnel delete %s", name))
-					return true, id
-				}
-			}
-		}
+	// Priority 2: Fallback to legacy unprefixed tunnel name for backward compatibility
+	// This allows Hera to adopt existing tunnels created before the prefix was added
+	exists, uuid = t.checkSingleTunnelExists(t.Config.Hostname)
+	if exists {
+		log.Warn("Found legacy tunnel without prefix - will use it but consider migrating", "name", t.Config.Hostname, "uuid", uuid)
+		log.Warn("To migrate, delete the old tunnel and restart the container", "command", fmt.Sprintf("cloudflared tunnel delete %s", t.Config.Hostname))
+		return true, uuid
 	}
 
 	return false, ""
+}
+
+// checkSingleTunnelExists checks if a specific tunnel name exists using cloudflared tunnel info
+// Returns (exists bool, uuid string)
+// This is O(1) lookup compared to O(N) for listing all tunnels
+func (t *Tunnel) checkSingleTunnelExists(tunnelName string) (bool, string) {
+	// Create context with 30-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Use cloudflared tunnel info for direct O(1) lookup
+	cmd := exec.CommandContext(ctx, "cloudflared",
+		"--origincert", t.Certificate.FullPath(),
+		"tunnel", "info",
+		tunnelName,
+		"--output", "json")
+
+	output, err := cmd.Output()
+	if err != nil {
+		// Tunnel doesn't exist or other error occurred
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Warn("Tunnel info lookup timed out", "tunnel_name", tunnelName)
+		} else {
+			log.Debug("Tunnel does not exist", "tunnel_name", tunnelName)
+		}
+		return false, ""
+	}
+
+	// Parse JSON output matching cloudflared tunnel info response structure
+	var tunnelInfo struct {
+		ID        string        `json:"id"`
+		Name      string        `json:"name"`
+		CreatedAt string        `json:"createdAt"`
+		Conns     []interface{} `json:"conns"`
+	}
+
+	if err := json.Unmarshal(output, &tunnelInfo); err != nil {
+		log.Debug("Failed to parse tunnel info", "tunnel_name", tunnelName, "error", err)
+		return false, ""
+	}
+
+	// Verify we got a valid tunnel ID
+	if tunnelInfo.ID == "" {
+		log.Debug("Tunnel info returned empty ID", "tunnel_name", tunnelName)
+		return false, ""
+	}
+
+	return true, tunnelInfo.ID
 }
 
 // createTunnel creates a new tunnel in Cloudflare using cloudflared CLI

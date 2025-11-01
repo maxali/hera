@@ -1,14 +1,15 @@
 package main
 
 import (
-    "fmt"
-    "io"
-    "os"
-    "strconv"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"sync"
+	"time"
 
-    "github.com/spf13/afero"
+	"github.com/spf13/afero"
 )
 
 // Listener holds config for an event listener and is used to listen for container events
@@ -33,20 +34,109 @@ func NewListener() (*Listener, error) {
 	return listener, nil
 }
 
-// Revive revives tunnels for currently running containers
+// Revive revives tunnels for currently running containers in parallel
 func (l *Listener) Revive() error {
-	handler := NewHandler(l.Client)
+	startTime := time.Now()
+	log.Info("Starting parallel tunnel revival")
+
 	containers, err := l.Client.ListContainers()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
+	if len(containers) == 0 {
+		log.Info("No containers found to revive")
+		return nil
+	}
+
+	log.Info("Found containers to revive", "count", len(containers))
+
+	// Get concurrency limit from environment variable
+	maxConcurrency := getRevivalConcurrency()
+	timeout := getRevivalTimeout()
+
+	log.Info("Using revival settings", "max_concurrency", maxConcurrency, "timeout", timeout)
+
+	// Semaphore for rate limiting
+	semaphore := make(chan struct{}, maxConcurrency)
+
+	// WaitGroup to track completion
+	var wg sync.WaitGroup
+
+	// Channel for collecting errors (buffered to prevent goroutine blocking)
+	errChan := make(chan revivalError, len(containers))
+
+	// Launch goroutines for each container
 	for _, c := range containers {
-		err := handler.HandleContainer(c.ID)
-		if err != nil {
-			return err
+		wg.Add(1)
+		go func(containerID string) {
+			defer wg.Done()
+
+			// Acquire semaphore (rate limit)
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Create context with timeout for this specific tunnel
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			// Create handler for this goroutine
+			handler := NewHandler(l.Client)
+
+			// Run tunnel revival with timeout
+			errChan <- l.reviveContainerWithTimeout(ctx, handler, containerID)
+		}(c.ID)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Collect results
+	var errors []revivalError
+	successCount := 0
+	timeoutCount := 0
+
+	for err := range errChan {
+		if err.err != nil {
+			errors = append(errors, err)
+			if err.timeout {
+				timeoutCount++
+			}
+		} else {
+			successCount++
 		}
 	}
+
+	duration := time.Since(startTime)
+
+	// Log summary
+	if len(errors) > 0 {
+		log.Error("Revival completed with errors",
+			"total", len(containers),
+			"success", successCount,
+			"failed", len(errors),
+			"timeouts", timeoutCount,
+			"duration", duration)
+
+		// Log individual failures
+		for _, e := range errors {
+			log.Error("Container revival failed",
+				"container_id", e.containerID,
+				"error", e.err,
+				"timeout", e.timeout)
+		}
+
+		// Return aggregated error with details
+		return fmt.Errorf("tunnel revival completed with %d failures out of %d containers (timeouts: %d)",
+			len(errors), len(containers), timeoutCount)
+	}
+
+	log.Info("Revival completed successfully",
+		"total", len(containers),
+		"success", successCount,
+		"duration", duration,
+		"avg_per_tunnel", duration/time.Duration(len(containers)))
 
 	return nil
 }
@@ -405,4 +495,88 @@ func (l *Listener) getAllCertificates() ([]*Certificate, error) {
 
 	log.Info("Found valid certificates", "count", len(validCerts), "path", CertificatePath)
 	return validCerts, nil
+}
+
+// getRevivalConcurrency returns the maximum concurrent tunnel revivals
+// Default: 5, Range: 1-100. Values above 10 may cause rate limiting
+func getRevivalConcurrency() int {
+	concurrency := 5 // Conservative default
+
+	if env := os.Getenv("HERA_REVIVAL_CONCURRENCY"); env != "" {
+		if val, err := strconv.Atoi(env); err == nil {
+			if val < 1 {
+				log.Warn("Invalid HERA_REVIVAL_CONCURRENCY (must be >= 1), using default",
+					"value", val, "default", 5)
+				return 5
+			}
+			if val > 100 {
+				log.Warn("HERA_REVIVAL_CONCURRENCY exceeds recommended maximum (100)",
+					"value", val, "warning", "May cause rate limiting")
+			}
+			concurrency = val
+		} else {
+			log.Warn("Invalid HERA_REVIVAL_CONCURRENCY (not a number), using default",
+				"value", env, "default", 5)
+		}
+	}
+
+	return concurrency
+}
+
+// getRevivalTimeout returns the timeout for each individual tunnel revival
+// Default: 30s
+func getRevivalTimeout() time.Duration {
+	timeout := 30 * time.Second // 6x normal creation time
+
+	if env := os.Getenv("HERA_REVIVAL_TIMEOUT"); env != "" {
+		if duration, err := time.ParseDuration(env); err == nil {
+			if duration < 5*time.Second {
+				log.Warn("HERA_REVIVAL_TIMEOUT too low (minimum 5s), using default",
+					"value", duration, "default", timeout)
+				return timeout
+			}
+			if duration > 5*time.Minute {
+				log.Warn("HERA_REVIVAL_TIMEOUT very high, may delay startup",
+					"value", duration)
+			}
+			timeout = duration
+		} else {
+			log.Warn("Invalid HERA_REVIVAL_TIMEOUT, using default",
+				"value", env, "default", timeout)
+		}
+	}
+
+	return timeout
+}
+
+// revivalError holds error information for a single container revival
+type revivalError struct {
+	containerID string
+	err         error
+	timeout     bool
+}
+
+// reviveContainerWithTimeout handles a single container with timeout
+func (l *Listener) reviveContainerWithTimeout(ctx context.Context, handler *Handler, containerID string) revivalError {
+	// Channel to receive result from HandleContainer
+	done := make(chan error, 1)
+
+	go func() {
+		done <- handler.HandleContainer(containerID)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return revivalError{containerID: containerID, err: err, timeout: false}
+		}
+		return revivalError{containerID: containerID, err: nil, timeout: false}
+
+	case <-ctx.Done():
+		return revivalError{
+			containerID: containerID,
+			err:         fmt.Errorf("tunnel revival timed out after %v", ctx.Err()),
+			timeout:     true,
+		}
+	}
 }

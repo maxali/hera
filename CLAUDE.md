@@ -55,6 +55,13 @@ cloudflared processes (children of Hera)
   - Proper zombie reaping (tini handles this as PID 1)
 - **Config Location**: Tunnel configs stored in `/etc/hera/tunnels/` (changed from `/var/run/s6/services/`)
 - **Log Location**: Tunnel logs stored in `/var/log/hera/`
+- **Parallel Tunnel Revival**: Concurrent tunnel creation during startup for fast recovery:
+  - Uses semaphore pattern with configurable concurrency limit (default: 20 concurrent tunnels)
+  - Expected performance: 5 tunnels in ~5s, 100 tunnels in ~30s (vs 8 minutes sequential)
+  - Individual timeout per tunnel (default: 30s) to prevent startup hangs
+  - Graceful error handling with partial success support (continues even if some tunnels fail)
+  - Comprehensive logging of success/failure metrics and timing
+  - Thread-safe with existing registry mutexes
 - **Garbage Collection**: Automatic cleanup of orphaned tunnels on startup with safety checks:
   - Only tunnels with zero connections and minimum age (10 min default)
   - Triple-check verification: Docker containers, local registry, ProcessManager state
@@ -136,6 +143,16 @@ Containers must have these Docker labels:
 - `HERA_GC_ENABLED`: Enable/disable garbage collection (default: `true`)
 - `HERA_GC_DRY_RUN`: Preview deletions without executing (default: `false`)
 - `HERA_GC_MIN_AGE_MINUTES`: Minimum tunnel age before deletion in minutes (default: `10`, min: `1`)
+
+**Parallel tunnel revival configuration:**
+- `HERA_REVIVAL_CONCURRENCY`: Maximum concurrent tunnel revivals during startup (default: `20`, range: `1-100`)
+  - Controls how many tunnels are created in parallel when Hera starts
+  - Higher values = faster startup but may trigger Cloudflare rate limits
+  - Recommended: 20 for most deployments, 10 for conservative setups, 50 for high-performance needs
+- `HERA_REVIVAL_TIMEOUT`: Timeout per individual tunnel revival (default: `30s`)
+  - Format: Go duration string (e.g., `30s`, `1m`, `90s`)
+  - Minimum: `5s`, recommended: `30s` (6x normal creation time)
+  - Prevents indefinite hangs during startup
 
 ## Dependencies
 
